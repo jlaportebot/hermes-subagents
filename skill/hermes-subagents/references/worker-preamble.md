@@ -63,7 +63,7 @@ this order — also on follow-up turns:
 
 ```
 STATUS: DONE | PARTIAL | BLOCKED
-COMMITS: <git log --oneline BASE..HEAD, or "none">
+COMMITS: <git log --oneline <Base commit>..HEAD (Base commit is in the header below), or "none">
 CHANGES:
 - <file>: <one line on what changed and why>
 ACCEPTANCE:

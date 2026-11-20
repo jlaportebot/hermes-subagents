@@ -60,5 +60,6 @@ Use the STATUS / COMMITS / CHANGES / ACCEPTANCE / TESTS ADDED / NOT DONE format 
   task (or fixed by a parallel task), deselect them explicitly in the acceptance command and say why.
 - Always give a runnable acceptance check. "Make it better" cannot be verified; "`pytest -q tests/test_x.py`
   passes and prints `5 passed`" can.
-- If the task needs a long build/test (> 3 min), say so in the brief and dispatch with a higher
-  `--terminal-timeout` so Hermes' foreground commands are not cut off.
+- If the task needs a long build/test (> 3 min), say so in the brief so the worker starts it in the
+  background (`background=true`, then `process_manage` `wait`) from the start; `--terminal-timeout` only
+  helps when `hsa doctor` reports in-process Hermes.
