@@ -444,11 +444,21 @@ def test_stop_fallback_skipped_when_workdir_is_shared(env, tmp_path):
 
 def test_broad_directories_are_never_swept(env, tmp_path):
     home = tmp_path / "home"
-    wd = make_repo(home / "src")
-    make_repo(wd / "inner")
+    wd = home / "src"
+    make_repo(wd / "one")
+    make_repo(wd / "two")
     hsa({**env, "HOME": str(home), "FAKE_HERMES_SLEEP": "60"}, "dispatch", "t1", str(wd), brief(tmp_path))
     out = hsa({**env, "HOME": str(home)}, "stop", "t1").stdout
     assert "no sweep" in out and "broad" in out
+
+
+def test_repo_with_submodule_checkout_is_not_broad(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    (wd / "sub").mkdir()
+    (wd / "sub" / ".git").write_text("gitdir: ../.git/modules/sub\n")
+    proc = hsa(env, "dispatch", "t1", str(wd), brief(tmp_path))
+    hsa(env, "wait", "t1", "--timeout", "30")
+    assert "broad" not in proc.stderr
 
 
 def test_state_of_run_whose_pid_was_reused_is_crashed(env, tmp_path):
@@ -700,3 +710,103 @@ def test_review_flags_untracked_files(env, tmp_path):
     (wd / "blob.bin").write_bytes(b"\xff\xfe\x00")
     out = hsa(env, "review", "t1").stdout
     assert "red flags in added lines: TODO" in out
+
+
+def test_second_stop_sweeps_commands_a_ghost_restarted(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa({**env, "FAKE_HERMES_SLEEP": "60", "FAKE_HERMES_EARLY_USAGE": "1"}, "dispatch", "t1", str(wd), brief(tmp_path))
+    sid = session_of(env, "t1")
+    hsa(env, "stop", "t1")
+    revived = spawn_sleep(wd, sid)
+    try:
+        out = hsa(env, "stop", "t1").stdout
+        time.sleep(1)
+        assert "client not running" in out and f"swept 1 commands tagged with session {sid}" in out
+        assert not alive(revived.pid)
+    finally:
+        reap(revived)
+
+
+def test_stop_refuses_to_sweep_next_to_a_gateway(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa({**env, "FAKE_HERMES_SLEEP": "60", "FAKE_HERMES_EARLY_USAGE": "1"}, "dispatch", "t1", str(wd), brief(tmp_path))
+    sid = session_of(env, "t1")
+    link = tmp_path / "gw" / "hermes"
+    link.parent.mkdir()
+    link.symlink_to(sys.executable)
+    gateway = subprocess.Popen([str(link), "-c", "import time; time.sleep(300)", "gateway", "run"], cwd=wd)
+    tagged = spawn_sleep(wd, sid)
+    try:
+        time.sleep(0.5)
+        out = hsa(env, "stop", "t1").stdout
+        assert "no sweep" in out and "gateway" in out and alive(tagged.pid)
+    finally:
+        reap(gateway, tagged)
+
+
+def test_loop_passes_when_verify_passes_even_if_worker_crashed(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    verify = tmp_path / "verify.sh"
+    verify.write_text("exit 0\n")
+    crashing = {**env, "FAKE_HERMES_CRASH": "1"}
+    hsa(crashing, "dispatch", "t1", str(wd), brief(tmp_path), "--verify", str(verify))
+    proc = hsa(crashing, "loop", "t1")
+    assert "LOOP PASS (verify passed; worker turn ended crashed)" in proc.stdout
+    assert len(calls(wd)) == 1
+
+
+def test_non_utf8_done_marker_is_failed_not_a_crash(env, tmp_path):
+    run_dir = write_meta(env, "t1", workdir=str(tmp_path), turn=1, pid=0, turn_started_at=time.time(), budget_s=60)
+    (run_dir / "turn-1.done").write_bytes(b"\xff\xfe\x80")
+    proc = hsa(env, "status", "--json")
+    assert json.loads(proc.stdout)[0]["state"] == "failed"
+
+
+def test_meta_without_pid_is_starting_only_briefly(env, tmp_path):
+    write_meta(env, "fresh", workdir=str(tmp_path), turn=1, created_at=time.time())
+    write_meta(env, "old", workdir=str(tmp_path), turn=1, created_at=time.time() - 3600)
+    states = {r["id"]: r["state"] for r in json.loads(hsa(env, "status", "--json").stdout)}
+    assert states == {"fresh": "starting", "old": "crashed"}
+
+
+def test_force_replaces_run_whose_dispatch_died_before_launch(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    write_meta(env, "t1", workdir=str(wd), turn=1, created_at=time.time() - 3600)
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path), "--force")
+    hsa(env, "wait", "t1", "--timeout", "30")
+
+
+def test_verify_pass_is_not_blocked_by_a_daemon_it_leaves_behind(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    verify = tmp_path / "verify.sh"
+    verify.write_text("setsid sleep 29.123 &\nexit 0\n")
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path), "--verify", str(verify), "--verify-timeout", "10")
+    hsa(env, "wait", "t1", "--timeout", "30")
+    started = time.time()
+    try:
+        proc = hsa(env, "verify", "t1", check=False)
+        assert proc.returncode == 0 and "VERIFY PASS" in proc.stdout and time.time() - started < 8
+    finally:
+        subprocess.run(["pkill", "-f", "sleep 29.123"])
+
+
+def test_stop_never_signals_live_non_wrapper_without_marker(env, tmp_path):
+    imposter = subprocess.Popen(["sleep", "300"])
+    try:
+        write_meta(env, "t1", workdir=str(tmp_path), turn=1, pid=imposter.pid,
+                   turn_started_at=time.time() - 1000, budget_s=60)
+        out = hsa(env, "stop", "t1").stdout
+        assert "client not running" in out and alive(imposter.pid)
+        assert read_meta(env, "t1")["stopped"] is True
+        assert json.loads(hsa(env, "status", "--json").stdout)[0]["state"] == "stopped"
+    finally:
+        reap(imposter)
+
+
+def test_followup_tolerates_meta_without_turn(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    write_meta(env, "t1", workdir=str(wd), reasoning="low", budget_s=60, terminal_timeout_s=60,
+               session_id="s-1", created_at=time.time() - 3600)
+    proc = hsa(env, "followup", "t1", "go")
+    assert "Traceback" not in proc.stderr and read_meta(env, "t1")["turn"] == 2
+    hsa(env, "wait", "t1", "--timeout", "30")
