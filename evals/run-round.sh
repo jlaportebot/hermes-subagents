@@ -17,10 +17,15 @@ done
 (
   until hsa tail t6-stop -n 3 | grep -q "CALL terminal"; do sleep 10; done
   sleep 20; log "t6 inside long command; stopping"
+  leftovers() { for p in $(pgrep -f 'seq 1 60'); do readlink "/proc/$p/cwd"; done | grep -c wt-t6-stop; }
   hsa stop t6-stop
+  echo "leftover tick processes right after stop: $(leftovers)"
   sleep 180
   hsa status t6-stop | tail -1
-  echo "leftover tick processes in t6 workdir: $(for p in $(pgrep -f 'seq 1 60'); do readlink /proc/$p/cwd; done | grep -c wt-t6-stop)"
+  echo "leftover tick processes after 180 s (ghost turn may restart them): $(leftovers)"
+  hsa stop t6-stop
+  sleep 5
+  echo "leftover tick processes after a second stop: $(leftovers)"
 ) > "$WS/t6.log" 2>&1 &
 wait
 hsa wait t1-bugfix t2-feature t3-tests > /dev/null
