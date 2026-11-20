@@ -1,0 +1,837 @@
+#!/usr/bin/env python3
+"""hsa — drive Hermes Agent workers from a Claude orchestrator.
+
+Every worker is a `hermes -z` one-shot run in its own process session, with its
+own run directory (prompt, output, usage, meta) and, normally, its own git
+worktree. Multi-turn work resumes the same Hermes session with `followup`.
+
+Subcommands: doctor, worktree, dispatch, status, tail, wait, followup, verify,
+loop, review, report, stop, path.  Run `hsa <cmd> -h` for details.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SKILL_DIR = Path(__file__).resolve().parent.parent
+RUNS_DIR = Path(os.environ.get("HSA_RUNS_DIR", Path.home() / ".local/state/hermes-subagents/runs"))
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+HERMES_BIN = os.environ.get("HSA_HERMES_BIN", "hermes")
+PREAMBLE = Path(os.environ.get("HSA_PREAMBLE", SKILL_DIR / "references/worker-preamble.md"))
+DEFAULT_BUDGET_S = 3 * 3600
+DEFAULT_TERMINAL_TIMEOUT_S = 1200
+SESSION_MATCH_SLACK_S = 5
+TAIL_CHARS = 220
+POLL_S = 15
+REPORT_SEARCH_PREFIX = 400
+REPORT_SCAN_MESSAGES = 60
+STOPPED_RC = 143
+HERMES_PROCESS_NAME = "hermes"
+START_TIME_SLACK_S = 2
+STOP_GRACE_S = 20
+INTERRUPT_GRACE_S = 30
+GHOST_AFTER_S = 45
+TIMEOUT_MARGIN_S = 600
+# Coding workers don't need messaging, cron, memory or skill-authoring tools; fewer tools also means a
+# smaller system prompt per call and no side effects on Hermes' own memory/skills.
+CODING_TOOLSETS = "terminal,file,code_execution,web,todo"
+
+
+# ---------------------------------------------------------------- run files
+class Run:
+    """One worker's run directory: meta.json + per-turn files turn-N.{prompt,out,err,usage}."""
+
+    def __init__(self, run_id: str):
+        self.id = run_id
+        self.dir = RUNS_DIR / run_id
+
+    @property
+    def meta_path(self) -> Path:
+        return self.dir / "meta.json"
+
+    def exists(self) -> bool:
+        return self.meta_path.exists()
+
+    def meta(self) -> dict:
+        return json.loads(self.meta_path.read_text())
+
+    def save(self, meta: dict) -> None:
+        """Write the whole meta (dispatch only: nothing else can be touching a brand-new run)."""
+        tmp = self.meta_path.with_suffix(f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(meta, indent=2))
+        tmp.replace(self.meta_path)
+
+    def patch(self, change) -> dict:
+        """Locked read-modify-write of meta.json. `change` is a dict of fields or a function that mutates the
+        fresh meta. Concurrent hsa processes (a background `loop`, a foreground `status`) never lose updates."""
+        with open(self.dir / "meta.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            fresh = self.meta()
+            if callable(change):
+                change(fresh)
+            else:
+                fresh.update(change)
+            self.save(fresh)
+            return fresh
+
+    def turn_file(self, turn: int, kind: str) -> Path:
+        return self.dir / f"turn-{turn}.{kind}"
+
+    def done_marker(self, turn: int) -> Path:
+        return self.turn_file(turn, "done")
+
+
+def require_run(run_id: str) -> Run:
+    run = Run(run_id)
+    if not run.exists():
+        sys.exit(f"hsa: no run named {run_id!r} in {RUNS_DIR}")
+    return run
+
+
+def pid_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    stat = Path(f"/proc/{pid}/stat")
+    return not (stat.exists() and stat.read_text().split(") ")[-1].startswith("Z"))
+
+
+def turn_state(run: Run, meta: dict) -> str:
+    """running | done | failed | stopped | crashed for the latest turn."""
+    turn = meta["turn"]
+    marker = run.done_marker(turn)
+    if marker.exists():
+        rc = int(marker.read_text().split()[0])
+        if meta.get("stopped"):
+            return "stopped"
+        return "done" if rc == 0 else "failed"
+    if pid_alive(meta.get("pid")):
+        return "running"
+    return "stopped" if meta.get("stopped") else "crashed"
+
+
+# ------------------------------------------------------------ hermes state.db
+def state_db() -> sqlite3.Connection | None:
+    path = HERMES_HOME / "state.db"
+    if not path.exists():
+        return None
+    try:
+        return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error as err:
+        print(f"hsa: cannot open {path}: {err}", file=sys.stderr)
+        return None
+
+
+def find_session(meta: dict) -> str | None:
+    """Session id of the run: usage file first, else newest oneshot session in its cwd."""
+    if meta.get("session_id"):
+        return meta["session_id"]
+    db = state_db()
+    if db is None:
+        return None
+    row = db.execute(
+        "select id from sessions where cwd=? and started_at>=? order by started_at limit 1",
+        (meta["workdir"], meta["turn_started_at"] - SESSION_MATCH_SLACK_S),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def session_info(session_id: str) -> dict:
+    db = state_db()
+    if db is None or not session_id:
+        return {}
+    row = db.execute(
+        "select api_call_count, tool_call_count, input_tokens, output_tokens, last_activity_at,"
+        " last_activity_description, ended_at, end_reason from sessions where id=?",
+        (session_id,),
+    ).fetchone()
+    if not row:
+        return {}
+    keys = ["api_calls", "tool_calls", "input_tokens", "output_tokens", "last_activity_at",
+            "last_activity", "ended_at", "end_reason"]
+    return dict(zip(keys, row))
+
+
+def session_messages(session_id: str, limit: int) -> list[tuple]:
+    db = state_db()
+    if db is None:
+        return []
+    rows = db.execute(
+        "select role, content, tool_name, tool_calls, timestamp from messages"
+        " where session_id=? order by id desc limit ?",
+        (session_id, limit),
+    ).fetchall()
+    return list(reversed(rows))
+
+
+def usage_session_id(run: Run, turn: int) -> str | None:
+    usage = run.turn_file(turn, "usage")
+    try:
+        return json.loads(usage.read_text()).get("session_id") if usage.exists() else None
+    except json.JSONDecodeError:
+        return None
+
+
+def refresh_session(run: Run, meta: dict) -> dict:
+    """Return the run's latest meta, recording its Hermes session id once it is known."""
+    meta = run.meta()
+    if meta.get("session_id"):
+        return meta
+    session_id = usage_session_id(run, meta["turn"]) or find_session(meta)
+    if not session_id:
+        return meta
+    def record(fresh: dict) -> None:
+        if not fresh.get("session_id"):
+            fresh["session_id"] = session_id
+
+    return run.patch(record)
+
+
+# ------------------------------------------------------------------ launching
+def build_prompt(brief_text: str, use_preamble: bool, run_id: str, workdir: str) -> str:
+    header = f"Task id: {run_id}\nWorking directory: {workdir}\n"
+    if not use_preamble:
+        return f"{header}\n{brief_text}"
+    return f"{PREAMBLE.read_text()}\n\n---\n\n{header}\n{brief_text}"
+
+
+def hermes_argv(meta: dict, prompt_file: Path, usage_file: Path, resume: str | None) -> list[str]:
+    argv = [HERMES_BIN, "-z", prompt_file.read_text(), "--in", meta["workdir"], "--yolo",
+            "--reasoning", meta["reasoning"], "--usage-file", str(usage_file)]
+    if meta.get("model"):
+        argv += ["-m", meta["model"]]
+    if meta.get("provider"):
+        argv += ["--provider", meta["provider"]]
+    if meta.get("toolsets"):
+        argv += ["-t", meta["toolsets"]]
+    if meta.get("skills"):
+        argv += ["--skills", meta["skills"]]
+    if meta.get("clean"):
+        argv += ["--ignore-rules"]
+    if resume:
+        argv += ["--resume", resume]
+    return argv
+
+
+def launch_turn(run: Run, meta: dict, prompt: str, resume: str | None) -> None:
+    """Start turn meta['turn'] detached in its own session; a shell wrapper writes the done marker."""
+    turn = meta["turn"]
+    prompt_file = run.turn_file(turn, "prompt")
+    prompt_file.write_text(prompt)
+    argv = hermes_argv(meta, prompt_file, run.turn_file(turn, "usage"), resume)
+    budget = int(meta["budget_s"])
+    inner = " ".join(shlex.quote(a) for a in ["timeout", "-k", "30", str(budget), *argv])
+    marker = shlex.quote(str(run.done_marker(turn)))
+    script = f'{inner}; rc=$?; echo "$rc $(date +%s)" > {marker}.tmp && mv {marker}.tmp {marker}'
+    env = dict(os.environ)
+    env.setdefault("TERMINAL_TIMEOUT", str(meta["terminal_timeout_s"]))
+    env.setdefault("TERMINAL_MAX_FOREGROUND_TIMEOUT", str(meta["terminal_timeout_s"] + TIMEOUT_MARGIN_S))
+    # Hermes' per-batch tool guard (default 420 s) would otherwise cut long foreground commands short.
+    env.setdefault("HERMES_CONCURRENT_TOOL_TIMEOUT_S", str(meta["terminal_timeout_s"] + 2 * TIMEOUT_MARGIN_S))
+    with open(run.turn_file(turn, "out"), "w") as out, open(run.turn_file(turn, "err"), "w") as err:
+        proc = subprocess.Popen(["bash", "-c", script], stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=err, env=env, cwd=meta["workdir"], start_new_session=True)
+    started = time.time()
+    entry = {"turn": turn, "started_at": started, "prompt_chars": len(prompt)}
+
+    def record(fresh: dict) -> None:
+        fresh.update(turn=turn, pid=proc.pid, turn_started_at=started, stopped=False,
+                     budget_s=meta["budget_s"], turns=[*fresh.get("turns", []), entry])
+
+    meta.update(run.patch(record))
+
+
+def ignore_scratch(workdir: str) -> None:
+    """Keep the worker scratch dir `.hsa-tmp/` out of git without touching tracked files."""
+    git_dir = git(workdir, "rev-parse", "--git-common-dir")
+    if not git_dir:
+        return
+    exclude = (Path(workdir) / git_dir if not os.path.isabs(git_dir) else Path(git_dir)) / "info/exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    text = exclude.read_text() if exclude.exists() else ""
+    if ".hsa-tmp/" not in text.split():
+        exclude.write_text(text + ("" if text.endswith("\n") or not text else "\n") + ".hsa-tmp/\n")
+
+
+def cmd_dispatch(args: argparse.Namespace) -> None:
+    run = Run(args.id)
+    if run.exists() and not args.force:
+        sys.exit(f"hsa: run {args.id!r} exists (use --force to replace, or `hsa followup`)")
+    workdir = str(Path(args.workdir).resolve())
+    if not Path(workdir).is_dir():
+        sys.exit(f"hsa: workdir {workdir} does not exist")
+    busy = [r.id for r in all_runs() if r.id != args.id and r.meta()["workdir"] == workdir
+            and turn_state(r, r.meta()) == "running"]
+    if busy and not args.share_workdir:
+        sys.exit(f"hsa: {workdir} already has a running worker ({', '.join(busy)}); "
+                 "give each worker its own worktree (`hsa worktree`) or pass --share-workdir")
+    if is_broad_dir(workdir):
+        print(f"hsa: warning: {workdir} is a broad directory; give workers a dedicated worktree "
+              "(`hsa worktree`) — `hsa stop` will not sweep commands there", file=sys.stderr)
+    ignore_scratch(workdir)
+    if run.dir.exists():
+        shutil.rmtree(run.dir)
+    run.dir.mkdir(parents=True)
+    brief = Path(args.brief).read_text()
+    shutil.copy(args.brief, run.dir / "brief.md")
+    meta = {
+        "id": args.id, "workdir": workdir, "brief": str(Path(args.brief).resolve()),
+        "reasoning": args.reasoning, "model": args.model, "provider": args.provider,
+        "toolsets": CODING_TOOLSETS if args.coding and not args.toolsets else args.toolsets,
+        "skills": args.skills, "clean": args.clean,
+        "budget_s": args.budget, "terminal_timeout_s": args.terminal_timeout,
+        "verify": str(Path(args.verify).resolve()) if args.verify else None,
+        "base": args.base or git_head(workdir), "created_at": time.time(), "turn": 1,
+    }
+    run.save(meta)
+    launch_turn(run, meta, build_prompt(brief, not args.no_preamble, args.id, workdir), None)
+    print(f"dispatched {args.id}: pid {meta['pid']}  workdir {workdir}  base {meta['base']}")
+    print(f"run dir {run.dir}")
+
+
+def cmd_followup(args: argparse.Namespace) -> None:
+    run = require_run(args.id)
+    meta = refresh_session(run, run.meta())
+    if turn_state(run, meta) == "running":
+        sys.exit(f"hsa: {args.id} is still running turn {meta['turn']}; wait or stop it first")
+    message = Path(args.file).read_text() if args.file else args.message
+    if not message:
+        sys.exit("hsa: give a message or -f FILE")
+    if not meta.get("session_id"):
+        sys.exit(f"hsa: no Hermes session id recorded for {args.id}; cannot resume")
+    if is_ghost(meta, session_info(meta["session_id"])):
+        print(f"hsa: note: {args.id} is a ghost (its stopped turn still runs in the Hermes gateway); "
+              "this message is queued and runs after that turn ends", file=sys.stderr)
+    if args.budget:
+        meta["budget_s"] = args.budget
+    meta["turn"] += 1
+    if not args.raw:
+        message += REPORT_REMINDER
+    launch_turn(run, meta, message, meta["session_id"])
+    print(f"follow-up turn {meta['turn']} for {args.id}: pid {meta['pid']} session {meta['session_id']}")
+
+
+# ------------------------------------------------------------------ observing
+def all_runs() -> list[Run]:
+    if not RUNS_DIR.exists():
+        return []
+    return [Run(p.name) for p in sorted(RUNS_DIR.iterdir()) if (p / "meta.json").exists()]
+
+
+def fmt_age(seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    seconds = int(seconds)
+    return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m" if seconds >= 3600 else f"{seconds // 60}m{seconds % 60:02d}s"
+
+
+def is_ghost(meta: dict, info: dict) -> bool:
+    """Stopped locally, but the Hermes session is still open and recorded activity after the stop."""
+    stopped_at, last = meta.get("stopped_at"), info.get("last_activity_at")
+    return bool(stopped_at and last and not info.get("ended_at") and last > stopped_at + GHOST_AFTER_S)
+
+
+def run_summary(run: Run) -> dict:
+    meta = refresh_session(run, run.meta())
+    state = turn_state(run, meta)
+    info = session_info(meta.get("session_id"))
+    if state == "stopped" and is_ghost(meta, info):
+        state = "ghost"
+    end = run.done_marker(meta["turn"])
+    finished = float(end.read_text().split()[1]) if end.exists() else time.time()
+    last = info.get("last_activity_at")
+    return {"id": run.id, "state": state, "turn": meta["turn"], "api_calls": info.get("api_calls"),
+            "tools": info.get("tool_calls"), "elapsed": fmt_age(finished - meta["turn_started_at"]),
+            "idle": fmt_age(time.time() - last) if (last and state == "running") else "-",
+            "activity": (info.get("last_activity") or "")[:60], "workdir": meta["workdir"]}
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    runs = [require_run(i) for i in args.ids] if args.ids else all_runs()
+    rows = [run_summary(r) for r in runs]
+    if args.active:
+        rows = [r for r in rows if r["state"] == "running"]
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    print(f"{'id':<22} {'state':<8} {'turn':>4} {'calls':>5} {'tools':>5} {'elapsed':>8} {'idle':>7}  activity")
+    for r in rows:
+        print(f"{r['id']:<22} {r['state']:<8} {r['turn']:>4} {r['api_calls'] or 0:>5} {r['tools'] or 0:>5} "
+              f"{r['elapsed']:>8} {r['idle']:>7}  {r['activity']}")
+
+
+def describe_message(role: str, content: str | None, tool_name: str | None, tool_calls: str | None) -> str:
+    if role == "assistant" and tool_calls:
+        try:
+            calls = json.loads(tool_calls)
+        except json.JSONDecodeError:
+            return f"assistant -> {tool_calls[:TAIL_CHARS]}"
+        parts = []
+        for call in calls:
+            fn = call.get("function", {})
+            parts.append(f"{fn.get('name')}({(fn.get('arguments') or '')[:TAIL_CHARS]})")
+        text = f" | says: {content[:TAIL_CHARS]}" if content else ""
+        return "CALL " + "; ".join(parts) + text
+    body = (content or "").replace("\n", " ")[:TAIL_CHARS]
+    return f"{'RESULT ' + str(tool_name) if role == 'tool' else role.upper()}: {body}"
+
+
+def cmd_tail(args: argparse.Namespace) -> None:
+    run = require_run(args.id)
+    meta = refresh_session(run, run.meta())
+    sid = meta.get("session_id")
+    if not sid:
+        print("no session yet (Hermes still starting up)")
+        return
+    for role, content, tool_name, tool_calls, ts in session_messages(sid, args.n):
+        print(f"{time.strftime('%H:%M:%S', time.localtime(ts))} {describe_message(role, content, tool_name, tool_calls)}")
+
+
+def cmd_wait(args: argparse.Namespace) -> None:
+    """Block until all (or --any) named runs finish their current turn; prints a status line per change."""
+    runs = [require_run(i) for i in args.ids]
+    deadline = time.time() + args.timeout if args.timeout else None
+    seen: dict[str, str] = {}
+    while True:
+        states = {r.id: turn_state(r, r.meta()) for r in runs}
+        for rid, st in states.items():
+            if seen.get(rid) != st:
+                print(f"{time.strftime('%H:%M:%S')} {rid}: {st}", flush=True)
+        seen = states
+        finished = [rid for rid, st in states.items() if st != "running"]
+        if (args.any and finished) or len(finished) == len(runs):
+            return
+        if deadline and time.time() > deadline:
+            sys.exit(f"hsa wait: timeout; still running: {[r for r, s in states.items() if s == 'running']}")
+        time.sleep(POLL_S)
+
+
+# --------------------------------------------------------------- controlling
+def child_map() -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat.read_text().rsplit(") ", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        children.setdefault(int(fields[1]), []).append(int(stat.parent.name))
+    return children
+
+
+def process_tree(root: int) -> list[int]:
+    """root and all its descendants. Needed because `timeout` and Hermes' terminal tool start their
+    children in new process groups/sessions, so killpg on the wrapper alone leaves Hermes running."""
+    children, tree, todo = child_map(), [], [root]
+    while todo:
+        pid = todo.pop()
+        tree.append(pid)
+        todo.extend(children.get(pid, []))
+    return tree
+
+
+def signal_all(pids: list[int], sig: int) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            continue
+
+
+def wait_gone(pids: list[int], seconds: int) -> list[int]:
+    for _ in range(seconds):
+        if not any(pid_alive(p) for p in pids):
+            return []
+        time.sleep(1)
+    return [p for p in pids if pid_alive(p)]
+
+
+def proc_cwd(pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def proc_comm(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return ""
+
+
+def parent_of(pid: int) -> int:
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def ancestors(pid: int) -> list[int]:
+    chain, current = [], parent_of(pid)
+    while current > 1:
+        chain.append(current)
+        current = parent_of(current)
+    return chain
+
+
+def proc_started_at(pid: int) -> float:
+    """Process start as a Unix timestamp (0.0 if unknown)."""
+    try:
+        ticks = int(Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19])
+        boot = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines()
+                    if line.startswith("btime "))
+    except (OSError, IndexError, ValueError, StopIteration):
+        return 0.0
+    return boot + ticks / os.sysconf("SC_CLK_TCK")
+
+
+def is_broad_dir(workdir: str) -> bool:
+    return workdir in {"/", str(Path.home())} or Path(workdir).parent == Path("/")
+
+
+def hermes_spawned_in(workdir: str, since: float) -> list[int]:
+    """Commands Hermes runs for this worker outside the client's tree (a Hermes gateway runs one-shot tools
+    itself): processes started during this turn, whose cwd is inside the worker's workdir and that descend
+    from a process named exactly `hermes`. Never hsa itself or its ancestors; never for broad workdirs
+    ($HOME, /, top-level dirs), where unrelated Hermes jobs of the user could match."""
+    if is_broad_dir(workdir):
+        return []
+    protected = {os.getpid(), *ancestors(os.getpid())}
+    found = []
+    for entry in Path("/proc").glob("[0-9]*"):
+        pid = int(entry.name)
+        cwd = proc_cwd(pid)
+        if pid in protected or not (cwd == workdir or cwd.startswith(workdir + "/")):
+            continue
+        if proc_started_at(pid) + START_TIME_SLACK_S < since:
+            continue
+        if any(proc_comm(a) == HERMES_PROCESS_NAME for a in ancestors(pid)):
+            found.append(pid)
+    return found
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    """SIGINT first (Hermes' own Ctrl+C path interrupts the turn, including one hosted by a gateway),
+    then SIGTERM, then SIGKILL, applied to the wrapper's whole process tree."""
+    run = require_run(args.id)
+    meta = run.meta()
+    pid = meta.get("pid")
+    if not pid_alive(pid):
+        print(f"{args.id}: not running")
+        return
+    meta = run.patch({"stopped": True, "stopped_at": time.time()})
+    tree = process_tree(pid)
+    signal_all(tree[1:], signal.SIGINT)
+    survivors = wait_gone(tree, INTERRUPT_GRACE_S)
+    signal_all(survivors, signal.SIGTERM)
+    survivors = wait_gone(survivors, STOP_GRACE_S)
+    signal_all(survivors, signal.SIGKILL)
+    spawned = hermes_spawned_in(meta["workdir"], meta["turn_started_at"])
+    signal_all(spawned, signal.SIGTERM)
+    signal_all(wait_gone(spawned, STOP_GRACE_S), signal.SIGKILL)
+    marker = run.done_marker(meta["turn"])
+    if not marker.exists():
+        marker.write_text(f"{STOPPED_RC} {int(time.time())}\n")
+    print(f"{args.id}: stopped {len(tree)} client processes ({len(survivors)} needed SIGKILL), "
+          f"{len(spawned)} Hermes-spawned commands in the workdir. "
+          f"`hsa status {args.id}` shows 'ghost' if the Hermes session keeps running server-side.")
+
+
+def git(workdir: str, *argv: str) -> str:
+    proc = subprocess.run(["git", "-C", workdir, *argv], capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def git_head(workdir: str) -> str | None:
+    return git(workdir, "rev-parse", "HEAD") or None
+
+
+def cmd_worktree(args: argparse.Namespace) -> None:
+    repo = str(Path(args.repo).resolve())
+    path = Path(args.path or Path(repo).parent / f"wt-{args.branch.replace('/', '-')}").resolve()
+    base = args.base or "HEAD"
+    proc = subprocess.run(["git", "-C", repo, "worktree", "add", "-b", args.branch, str(path), base],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.exit(f"hsa worktree: {proc.stderr.strip()}")
+    print(path)
+
+
+def run_verify(run: Run, meta: dict) -> tuple[int, str]:
+    script = meta.get("verify")
+    if not script:
+        return 0, "(no verify script)"
+    proc = subprocess.run(["bash", script], cwd=meta["workdir"], capture_output=True, text=True,
+                          env={**os.environ, "HSA_WORKDIR": meta["workdir"], "HSA_BASE": meta.get("base") or ""})
+    output = (proc.stdout + proc.stderr)[-6000:]
+    record = {"turn": meta["turn"], "rc": proc.returncode, "at": time.time()}
+    meta.update(run.patch(lambda fresh: fresh.update(verifications=[*fresh.get("verifications", []), record])))
+    run.turn_file(meta["turn"], "verify").write_text(output)
+    return proc.returncode, output
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    run = require_run(args.id)
+    rc, output = run_verify(run, run.meta())
+    print(output)
+    print(f"VERIFY {'PASS' if rc == 0 else 'FAIL'} (rc={rc})")
+    sys.exit(rc)
+
+
+REPORT_REMINDER = """
+
+---
+When you finish this turn, your final answer must START with the `STATUS:` line and use exactly these
+headings, in order, under 40 lines: STATUS / COMMITS / CHANGES / ACCEPTANCE / TESTS ADDED / NOT DONE / RISKS
+(the format from your worker rules). Real command output only."""
+
+FIX_TEMPLATE = """The orchestrator re-ran the acceptance check for your task and it FAILED (exit {rc}).
+Output (last part):
+```
+{output}
+```
+Find the root cause, fix it in the same working directory, re-run the check yourself
+(`bash {script}` from {workdir}) until it passes, commit, and end with the same final report format
+(put the passing check output under ACCEPTANCE). If you are blocked, explain exactly what blocks you."""
+
+
+def cmd_loop(args: argparse.Namespace) -> None:
+    """wait -> verify -> (on fail) follow-up with the failure, up to --max-fixes rounds. Zero orchestrator tokens."""
+    run = require_run(args.id)
+    for attempt in range(args.max_fixes + 1):
+        cmd_wait(argparse.Namespace(ids=[args.id], any=False, timeout=None))
+        meta = refresh_session(run, run.meta())
+        state = turn_state(run, meta)
+        rc, output = run_verify(run, meta)
+        print(f"turn {meta['turn']} state={state} verify rc={rc}", flush=True)
+        if rc == 0 and state == "done":
+            print("LOOP PASS")
+            return
+        if attempt == args.max_fixes:
+            break
+        msg = FIX_TEMPLATE.format(rc=rc, output=output[-3000:], script=meta["verify"], workdir=meta["workdir"])
+        if state != "done":
+            msg = f"Your previous turn ended with state '{state}' (not a clean finish).\n\n" + msg
+        cmd_followup(argparse.Namespace(id=args.id, message=msg, file=None, budget=None, raw=False))
+    print("LOOP FAIL")
+    sys.exit(1)
+
+
+# -------------------------------------------------------------------- review
+RED_FLAGS = ["console.log(", "dbg!(", "println!(\"debug", "TODO", "FIXME", "breakpoint()", "pdb.set_trace"]
+
+
+def added_lines(workdir: str, base: str) -> list[str]:
+    diff = git(workdir, "diff", base, "--unified=0")
+    return [l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
+
+
+def cmd_review(args: argparse.Namespace) -> None:
+    """One compact packet for the orchestrator: outcome, usage, commits, diffstat, flags, final report."""
+    run = require_run(args.id)
+    meta = refresh_session(run, run.meta())
+    wd, base, turn = meta["workdir"], args.base or meta.get("base"), meta["turn"]
+    usage = {}
+    if run.turn_file(turn, "usage").exists():
+        usage = json.loads(run.turn_file(turn, "usage").read_text() or "{}")
+    print(f"== {args.id}  state={turn_state(run, meta)}  turn={turn}  exit={usage.get('turn_exit_reason')}"
+          f"  calls={usage.get('api_calls')}  failed={usage.get('failed')}")
+    if base:
+        print("== commits\n" + (git(wd, "log", "--oneline", f"{base}..HEAD") or "(none)"))
+        print("== diffstat (base..worktree)\n" + (git(wd, "diff", "--stat", base) or "(no changes)"))
+        flags = sorted({f for line in added_lines(wd, base) for f in RED_FLAGS if f in line})
+        print("== red flags in added lines: " + (", ".join(flags) or "none"))
+    print("== uncommitted\n" + (git(wd, "status", "--short") or "(clean)"))
+    if meta.get("verifications"):
+        print("== verify history: " + ", ".join(f"t{v['turn']}:rc{v['rc']}" for v in meta["verifications"]))
+    report = latest_report(run, meta)
+    err = run.turn_file(turn, "err")
+    if not report and err.exists():
+        print("== stderr tail\n" + err.read_text()[-1500:])
+    missing = [h for h in REPORT_HEADINGS if not re.search(rf"^\W*{re.escape(h)}\b", report, re.M)]
+    if missing:
+        print("== report missing headings: " + ", ".join(missing))
+    print("== worker report\n" + (report[:args.chars] or "(empty)"))
+
+
+REPORT_HEADINGS = ["STATUS", "COMMITS", "CHANGES", "ACCEPTANCE", "TESTS ADDED", "NOT DONE / RISKS"]
+REPORT_START = re.compile(r"^\W*STATUS:", re.M)
+
+
+def latest_report(run: Run, meta: dict) -> str:
+    """The worker's structured report for the current turn. Usually the final answer; but Hermes configs with
+    post-answer 'evidence' nudges can make the last message an evidence reply, so fall back to the newest
+    assistant message of this turn that contains a STATUS: line."""
+    out_file = run.turn_file(meta["turn"], "out")
+    out = out_file.read_text() if out_file.exists() else ""
+    match = REPORT_START.search(out)
+    if match and match.start() < REPORT_SEARCH_PREFIX:
+        return out[match.start():].strip()
+    for role, content, _tool, _calls, ts in reversed(session_messages(meta.get("session_id"), REPORT_SCAN_MESSAGES)):
+        if role != "assistant" or not content or ts < meta["turn_started_at"]:
+            continue
+        found = REPORT_START.search(content)
+        if found:
+            return content[found.start():].strip()
+    return out.strip()
+
+
+def cmd_report(args: argparse.Namespace) -> None:
+    run = require_run(args.id)
+    print(latest_report(run, refresh_session(run, run.meta())))
+
+
+DOCTOR_PROBE_VALUE = "forwarded"
+DOCTOR_PROMPT = ("Run exactly this one shell command with your terminal tool, then reply with only its raw "
+                 "output and nothing else: echo \"probe=${HSA_DOCTOR_PROBE:-unset} ppid=$PPID\"")
+DOCTOR_PROBE_TIMEOUT_S = 900
+DOCTOR_LINE = re.compile(r"probe=(\S+) ppid=(\d+)")
+
+
+def doctor_static() -> bool:
+    """Print setup checks that need no model call; True when a probe run can be attempted."""
+    hermes = shutil.which(HERMES_BIN)
+    print(f"hermes binary : {hermes or 'MISSING (install Hermes Agent or set HSA_HERMES_BIN)'}")
+    if hermes:
+        proc = subprocess.run([HERMES_BIN, "--version"], capture_output=True, text=True, timeout=120)
+        print(f"hermes version: {(proc.stdout or proc.stderr).strip().splitlines()[0] if (proc.stdout or proc.stderr).strip() else '?'}")
+    db = HERMES_HOME / "state.db"
+    print(f"session store : {db} ({'readable' if state_db() is not None else 'not found: live tail/status/ghost detection off'})")
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"runs dir      : {RUNS_DIR} (writable)")
+    return bool(hermes)
+
+
+def doctor_probe(timeout_s: int) -> None:
+    """One tiny real run: latency, whether client env reaches tools, and where tool commands execute."""
+    probe_dir = RUNS_DIR / "_doctor" / time.strftime("%Y%m%d-%H%M%S")
+    probe_dir.mkdir(parents=True)
+    usage_file = probe_dir / "usage.json"
+    argv = [HERMES_BIN, "-z", DOCTOR_PROMPT, "--in", str(probe_dir), "--yolo", "--reasoning", "low",
+            "-t", "terminal", "--usage-file", str(usage_file)]
+    started = time.time()
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
+                          env={**os.environ, "HSA_DOCTOR_PROBE": DOCTOR_PROBE_VALUE}, cwd=probe_dir)
+    elapsed = time.time() - started
+    usage = json.loads(usage_file.read_text()) if usage_file.exists() and usage_file.read_text().strip() else {}
+    found = DOCTOR_LINE.search(proc.stdout)
+    print(f"probe run     : rc={proc.returncode} in {elapsed:.0f}s, {usage.get('api_calls')} model calls, "
+          f"model={usage.get('model')}")
+    if not found:
+        print("probe output  : unexpected; first lines:\n" + (proc.stdout or proc.stderr)[:600])
+        return
+    forwarded = found.group(1) == DOCTOR_PROBE_VALUE
+    gateway = pid_alive(int(found.group(2)))
+    print(f"env forwarded : {'yes' if forwarded else 'NO - env vars set by hsa (timeouts) do not reach workers'}")
+    print(f"tool host     : {'Hermes gateway (long-lived process)' if gateway else 'the hermes client process'}")
+    if gateway:
+        print("=> gateway-hosted: `hsa stop` kills the client and the worker's commands, but a turn can continue")
+        print("   server-side (status 'ghost'). Keep tasks small; let turns finish and correct them with follow-ups.")
+    else:
+        print("=> in-process: `hsa stop` ends the run completely; --terminal-timeout/--budget are hard limits.")
+    if not forwarded:
+        print("=> long commands: workers must use background mode + process_manage wait (the preamble says so).")
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    if doctor_static() and not args.no_probe:
+        doctor_probe(args.timeout)
+
+
+def cmd_path(args: argparse.Namespace) -> None:
+    print(require_run(args.id).dir if args.id else RUNS_DIR)
+
+
+# ---------------------------------------------------------------------- main
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="hsa", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    d = sub.add_parser("dispatch", help="start a worker on a brief (returns immediately)")
+    d.add_argument("id"); d.add_argument("workdir"); d.add_argument("brief")
+    d.add_argument("--verify", help="acceptance script run (bash, cwd=workdir) by `hsa verify/loop`")
+    d.add_argument("--base", help="git base for review (default: current HEAD of workdir)")
+    d.add_argument("-r", "--reasoning", default="high")
+    d.add_argument("-m", "--model"); d.add_argument("--provider")
+    d.add_argument("-t", "--toolsets"); d.add_argument("--skills")
+    d.add_argument("--coding", action="store_true", help=f"toolsets preset for code work: {CODING_TOOLSETS}")
+    d.add_argument("--budget", type=int, default=DEFAULT_BUDGET_S, help="hard wall clock per turn, seconds")
+    d.add_argument("--terminal-timeout", type=int, default=DEFAULT_TERMINAL_TIMEOUT_S,
+                   help="Hermes foreground command timeout (default 1200 s); only effective when Hermes runs "
+                        "turns in-process (see `hsa doctor`)")
+    d.add_argument("--clean", action="store_true", help="--ignore-rules: no AGENTS.md/memory/skills injection")
+    d.add_argument("--no-preamble", action="store_true", help="send the brief without the worker preamble")
+    d.add_argument("--share-workdir", action="store_true", help="allow a second worker in a busy workdir")
+    d.add_argument("--force", action="store_true", help="replace an existing run with this id")
+    d.set_defaults(fn=cmd_dispatch)
+
+    f = sub.add_parser("followup", help="send another turn to a finished worker (same Hermes session)")
+    f.add_argument("id"); f.add_argument("message", nargs="?"); f.add_argument("-f", "--file")
+    f.add_argument("--budget", type=int)
+    f.add_argument("--raw", action="store_true", help="send the message without the report-format reminder")
+    f.set_defaults(fn=cmd_followup)
+
+    s = sub.add_parser("status", help="table of runs"); s.add_argument("ids", nargs="*")
+    s.add_argument("--active", action="store_true"); s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_status)
+
+    t = sub.add_parser("tail", help="last N messages/tool calls of a run (live, from Hermes state.db)")
+    t.add_argument("id"); t.add_argument("-n", type=int, default=12); t.set_defaults(fn=cmd_tail)
+
+    w = sub.add_parser("wait", help="block until runs finish (use with run_in_background)")
+    w.add_argument("ids", nargs="+"); w.add_argument("--any", action="store_true")
+    w.add_argument("--timeout", type=int); w.set_defaults(fn=cmd_wait)
+
+    v = sub.add_parser("verify", help="run the run's acceptance script now"); v.add_argument("id")
+    v.set_defaults(fn=cmd_verify)
+
+    lp = sub.add_parser("loop", help="wait+verify+auto-follow-up with failures until pass")
+    lp.add_argument("id"); lp.add_argument("--max-fixes", type=int, default=3); lp.set_defaults(fn=cmd_loop)
+
+    r = sub.add_parser("review", help="compact review packet: commits, diffstat, flags, final report")
+    r.add_argument("id"); r.add_argument("--base"); r.add_argument("--chars", type=int, default=4000)
+    r.set_defaults(fn=cmd_review)
+
+    k = sub.add_parser("stop", help="kill a running worker's process group"); k.add_argument("id")
+    k.set_defaults(fn=cmd_stop)
+
+    g = sub.add_parser("worktree", help="git worktree add -b BRANCH for an isolated worker")
+    g.add_argument("repo"); g.add_argument("branch"); g.add_argument("--base"); g.add_argument("--path")
+    g.set_defaults(fn=cmd_worktree)
+
+    rp = sub.add_parser("report", help="print the worker's structured report for the latest turn")
+    rp.add_argument("id"); rp.set_defaults(fn=cmd_report)
+
+    dr = sub.add_parser("doctor", help="check the setup; one tiny probe run reveals latency and hosting mode")
+    dr.add_argument("--no-probe", action="store_true", help="skip the model call")
+    dr.add_argument("--timeout", type=int, default=DOCTOR_PROBE_TIMEOUT_S)
+    dr.set_defaults(fn=cmd_doctor)
+
+    pa = sub.add_parser("path", help="print the runs dir, or one run's dir"); pa.add_argument("id", nargs="?")
+    pa.set_defaults(fn=cmd_path)
+    return p
+
+
+def main() -> None:
+    args = parser().parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
