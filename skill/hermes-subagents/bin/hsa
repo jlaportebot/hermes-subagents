@@ -11,6 +11,7 @@ loop, review, report, stop, path.  Run `hsa <cmd> -h` for details.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -43,16 +44,52 @@ STOP_GRACE_S = 20
 INTERRUPT_GRACE_S = 30
 GHOST_AFTER_S = 45
 TIMEOUT_MARGIN_S = 600
+RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+MAX_PROMPT_BYTES = 100_000
+DEFAULT_VERIFY_TIMEOUT_S = 1800
+VERIFY_TIMEOUT_RC = 124
+VERIFY_MISSING_RC = 127
+WRAPPER_START_SLACK_S = 5
+WAIT_MARGIN_S = 600
+DB_TIMEOUT_S = 5
+SESSION_ENV = "HERMES_SESSION_ID"
+MAX_UNTRACKED_BYTES = 1_000_000
+ACTIVE_STATES = ("running", "starting")
+USAGE_SOURCE = "usage"
+STARTING_GRACE_S = 60
+SCRIPT_OUTPUT_TAIL = 6000
 # Coding workers don't need messaging, cron, memory or skill-authoring tools; fewer tools also means a
 # smaller system prompt per call and no side effects on Hermes' own memory/skills.
 CODING_TOOLSETS = "terminal,file,code_execution,web,todo"
 
 
 # ---------------------------------------------------------------- run files
+_WARNED: set[str] = set()
+
+
+def warn_once(key: str, message: str) -> None:
+    """One stderr warning per process per problem, so a broken state.db doesn't flood every command."""
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    print(message, file=sys.stderr)
+
+
+def load_json_dict(path: Path) -> dict:
+    """A JSON object from path; {} for a missing, empty, partial or non-object file."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 class Run:
     """One worker's run directory: meta.json + per-turn files turn-N.{prompt,out,err,usage}."""
 
     def __init__(self, run_id: str):
+        if not RUN_ID_RE.fullmatch(run_id):
+            sys.exit(f"hsa: invalid run id {run_id!r} (letters, digits, . _ -; max 64; no leading . _ -)")
         self.id = run_id
         self.dir = RUNS_DIR / run_id
 
@@ -85,6 +122,14 @@ class Run:
             self.save(fresh)
             return fresh
 
+    @contextlib.contextmanager
+    def launch_lock(self):
+        """Serialises 'check state, bump turn, launch'. A file separate from meta.lock: patch() inside it
+        would deadlock on a second open of the same lock file."""
+        with open(self.dir / "launch.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
     def turn_file(self, turn: int, kind: str) -> Path:
         return self.dir / f"turn-{turn}.{kind}"
 
@@ -112,103 +157,156 @@ def pid_alive(pid: int | None) -> bool:
     return not (stat.exists() and stat.read_text().split(") ")[-1].startswith("Z"))
 
 
+def is_wrapper(meta: dict) -> bool:
+    """The turn's shell wrapper is still alive. A bare pid check is fooled by PID reuse after a reboot or a
+    long idle, so also require a bash that started when the turn did (unknown start time: trust the pid)."""
+    pid = meta.get("pid")
+    if not pid_alive(pid):
+        return False
+    started = proc_started_at(pid)
+    if not started:
+        return True
+    return proc_comm(pid) == "bash" and abs(started - (meta.get("turn_started_at") or 0)) <= WRAPPER_START_SLACK_S
+
+
+def read_marker(path: Path) -> tuple[int, float] | None:
+    """(exit code, finish time) from a done marker; None if absent. Empty or garbled content counts as
+    failed (rc 1) with the file's mtime, so a truncated marker never crashes a reader."""
+    try:
+        parts = path.read_bytes().decode(errors="replace").split()
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    try:
+        rc = int(parts[0])
+    except (IndexError, ValueError):
+        rc = 1
+    try:
+        finished = float(parts[1])
+    except (IndexError, ValueError):
+        finished = mtime
+    return rc, finished
+
+
+def starting_or_dead(run: Run, meta: dict) -> str:
+    """A meta without a pid is a launch in progress, unless it has been that way for a while: then the
+    dispatch died between saving the meta and launching, and the run counts as crashed."""
+    try:
+        born = meta.get("created_at") or run.meta_path.stat().st_mtime
+    except OSError:
+        return "crashed"
+    if time.time() - born <= STARTING_GRACE_S:
+        return "starting"
+    return "stopped" if meta.get("stopped") else "crashed"
+
+
 def turn_state(run: Run, meta: dict) -> str:
-    """running | done | failed | stopped | crashed for the latest turn."""
-    turn = meta["turn"]
-    marker = run.done_marker(turn)
-    if marker.exists():
-        rc = int(marker.read_text().split()[0])
+    """starting | running | done | failed | stopped | crashed for the latest turn."""
+    marker = read_marker(run.done_marker(meta.get("turn", 1)))
+    if marker:
         if meta.get("stopped"):
             return "stopped"
-        return "done" if rc == 0 else "failed"
-    if pid_alive(meta.get("pid")):
+        return "done" if marker[0] == 0 else "failed"
+    if not meta.get("pid"):
+        return starting_or_dead(run, meta)
+    if is_wrapper(meta):
         return "running"
     return "stopped" if meta.get("stopped") else "crashed"
 
 
 # ------------------------------------------------------------ hermes state.db
-def state_db() -> sqlite3.Connection | None:
+def db_rows(sql: str, params: tuple = ()) -> list[tuple] | None:
+    """Rows from Hermes' state.db, or None when it is absent or unreadable (one warning per process)."""
     path = HERMES_HOME / "state.db"
     if not path.exists():
         return None
     try:
-        return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=DB_TIMEOUT_S)) as db:
+            return db.execute(sql, params).fetchall()
     except sqlite3.Error as err:
-        print(f"hsa: cannot open {path}: {err}", file=sys.stderr)
+        warn_once("state-db", f"hsa: warning: cannot read Hermes state.db ({err}); live monitoring disabled")
         return None
 
 
 def find_session(meta: dict) -> str | None:
-    """Session id of the run: usage file first, else newest oneshot session in its cwd."""
-    if meta.get("session_id"):
-        return meta["session_id"]
-    db = state_db()
-    if db is None:
+    """Session id from state.db: the one session whose cwd is the workdir and that started with this turn.
+    Several candidates (two workers in one directory) are ambiguous, so don't guess."""
+    if not meta.get("workdir") or not meta.get("turn_started_at"):
         return None
-    row = db.execute(
-        "select id from sessions where cwd=? and started_at>=? order by started_at limit 1",
-        (meta["workdir"], meta["turn_started_at"] - SESSION_MATCH_SLACK_S),
-    ).fetchone()
-    return row[0] if row else None
+    rows = db_rows("select id from sessions where cwd=? and started_at>=?",
+                   (meta["workdir"], meta["turn_started_at"] - SESSION_MATCH_SLACK_S))
+    ids = {row[0] for row in rows or []}
+    if len(ids) > 1:
+        warn_once("ambiguous-session", f"hsa: warning: {len(ids)} Hermes sessions match {meta['workdir']}; "
+                  "not guessing a session id (give each worker its own worktree)")
+    return ids.pop() if len(ids) == 1 else None
 
 
-def session_info(session_id: str) -> dict:
-    db = state_db()
-    if db is None or not session_id:
-        return {}
-    row = db.execute(
+def session_info(session_id: str | None) -> dict:
+    rows = db_rows(
         "select api_call_count, tool_call_count, input_tokens, output_tokens, last_activity_at,"
         " last_activity_description, ended_at, end_reason from sessions where id=?",
         (session_id,),
-    ).fetchone()
-    if not row:
+    ) if session_id else None
+    if not rows:
         return {}
     keys = ["api_calls", "tool_calls", "input_tokens", "output_tokens", "last_activity_at",
             "last_activity", "ended_at", "end_reason"]
-    return dict(zip(keys, row))
+    return dict(zip(keys, rows[0]))
 
 
-def session_messages(session_id: str, limit: int) -> list[tuple]:
-    db = state_db()
-    if db is None:
+def session_messages(session_id: str | None, limit: int) -> list[tuple]:
+    if not session_id:
         return []
-    rows = db.execute(
-        "select role, content, tool_name, tool_calls, timestamp from messages"
-        " where session_id=? order by id desc limit ?",
-        (session_id, limit),
-    ).fetchall()
-    return list(reversed(rows))
+    rows = db_rows("select role, content, tool_name, tool_calls, timestamp from messages"
+                   " where session_id=? order by id desc limit ?", (session_id, limit))
+    return list(reversed(rows or []))
+
+
+def read_usage(run: Run, turn: int) -> dict:
+    return load_json_dict(run.turn_file(turn, "usage"))
 
 
 def usage_session_id(run: Run, turn: int) -> str | None:
-    usage = run.turn_file(turn, "usage")
-    try:
-        return json.loads(usage.read_text()).get("session_id") if usage.exists() else None
-    except json.JSONDecodeError:
-        return None
+    session_id = read_usage(run, turn).get("session_id")
+    return session_id if isinstance(session_id, str) and session_id else None
 
 
 def refresh_session(run: Run, meta: dict) -> dict:
-    """Return the run's latest meta, recording its Hermes session id once it is known."""
+    """Return the run's latest meta, recording its Hermes session id once it is known. The usage file is
+    authoritative and overrides an earlier state.db guess; the guess only fills the gap while a turn runs."""
     meta = run.meta()
-    if meta.get("session_id"):
+    if meta.get("session_source") == USAGE_SOURCE:
         return meta
-    session_id = usage_session_id(run, meta["turn"]) or find_session(meta)
-    if not session_id:
+    found = usage_session_id(run, meta.get("turn", 1))
+    source = USAGE_SOURCE
+    if not found:
+        found, source = (None, "") if meta.get("session_id") else (find_session(meta), "statedb")
+    if not found or (meta.get("session_id"), meta.get("session_source")) == (found, source):
         return meta
+
     def record(fresh: dict) -> None:
-        if not fresh.get("session_id"):
-            fresh["session_id"] = session_id
+        if fresh.get("session_source") != USAGE_SOURCE:
+            fresh.update(session_id=found, session_source=source)
 
     return run.patch(record)
 
 
 # ------------------------------------------------------------------ launching
-def build_prompt(brief_text: str, use_preamble: bool, run_id: str, workdir: str) -> str:
+def build_prompt(brief_text: str, use_preamble: bool, run_id: str, workdir: str, base: str | None) -> str:
     header = f"Task id: {run_id}\nWorking directory: {workdir}\n"
+    if base:
+        header += f"Base commit: {base}\n"
     if not use_preamble:
         return f"{header}\n{brief_text}"
     return f"{PREAMBLE.read_text()}\n\n---\n\n{header}\n{brief_text}"
+
+
+def check_prompt_size(prompt: str) -> None:
+    size = len(prompt.encode())
+    if size > MAX_PROMPT_BYTES:
+        sys.exit(f"hsa: prompt is {size} bytes, over the {MAX_PROMPT_BYTES} limit: Linux caps one argv element at "
+                 "128 KiB; move long material (specs, logs) into a file and name it in the brief.")
 
 
 def hermes_argv(meta: dict, prompt_file: Path, usage_file: Path, resume: str | None) -> list[str]:
@@ -253,6 +351,7 @@ def launch_turn(run: Run, meta: dict, prompt: str, resume: str | None) -> None:
     def record(fresh: dict) -> None:
         fresh.update(turn=turn, pid=proc.pid, turn_started_at=started, stopped=False,
                      budget_s=meta["budget_s"], turns=[*fresh.get("turns", []), entry])
+        fresh.pop("stopped_at", None)
 
     meta.update(run.patch(record))
 
@@ -269,69 +368,128 @@ def ignore_scratch(workdir: str) -> None:
         exclude.write_text(text + ("" if text.endswith("\n") or not text else "\n") + ".hsa-tmp/\n")
 
 
-def cmd_dispatch(args: argparse.Namespace) -> None:
-    run = Run(args.id)
-    if run.exists() and not args.force:
-        sys.exit(f"hsa: run {args.id!r} exists (use --force to replace, or `hsa followup`)")
-    workdir = str(Path(args.workdir).resolve())
-    if not Path(workdir).is_dir():
-        sys.exit(f"hsa: workdir {workdir} does not exist")
-    busy = [r.id for r in all_runs() if r.id != args.id and r.meta()["workdir"] == workdir
-            and turn_state(r, r.meta()) == "running"]
-    if busy and not args.share_workdir:
-        sys.exit(f"hsa: {workdir} already has a running worker ({', '.join(busy)}); "
-                 "give each worker its own worktree (`hsa worktree`) or pass --share-workdir")
-    if is_broad_dir(workdir):
-        print(f"hsa: warning: {workdir} is a broad directory; give workers a dedicated worktree "
-              "(`hsa worktree`) — `hsa stop` will not sweep commands there", file=sys.stderr)
-    ignore_scratch(workdir)
-    if run.dir.exists():
-        shutil.rmtree(run.dir)
+def prepare_run_dir(run: Run, force: bool) -> None:
+    """Create the run dir, replacing an old run only with --force and only if it is an idle hsa run dir."""
+    if not run.dir.exists():
+        run.dir.mkdir(parents=True)
+        return
+    if not run.exists():
+        if any(run.dir.iterdir()):
+            sys.exit(f"hsa: {run.dir} exists and is not an hsa run dir; remove it yourself")
+        return
+    if not force:
+        sys.exit(f"hsa: run {run.id!r} exists (use --force to replace, or `hsa followup`)")
+    try:
+        state = turn_state(run, run.meta())
+    except (OSError, ValueError):
+        state = "crashed"
+    if state in ACTIVE_STATES:
+        sys.exit(f"hsa: run {run.id!r} is {state}; `hsa stop {run.id}` it before --force")
+    shutil.rmtree(run.dir)
     run.dir.mkdir(parents=True)
-    brief = Path(args.brief).read_text()
-    shutil.copy(args.brief, run.dir / "brief.md")
-    meta = {
+
+
+def read_brief(path: str) -> str:
+    try:
+        return Path(path).read_text()
+    except OSError as err:
+        sys.exit(f"hsa: cannot read brief {path}: {err}")
+
+
+def busy_workers(workdir: str, own_id: str) -> list[str]:
+    return [r.id for r, m in all_run_metas() if r.id != own_id and m.get("workdir") == workdir
+            and turn_state(r, m) in ACTIVE_STATES]
+
+
+def new_meta(args: argparse.Namespace, workdir: str, base: str | None) -> dict:
+    return {
         "id": args.id, "workdir": workdir, "brief": str(Path(args.brief).resolve()),
         "reasoning": args.reasoning, "model": args.model, "provider": args.provider,
         "toolsets": CODING_TOOLSETS if args.coding and not args.toolsets else args.toolsets,
         "skills": args.skills, "clean": args.clean,
         "budget_s": args.budget, "terminal_timeout_s": args.terminal_timeout,
         "verify": str(Path(args.verify).resolve()) if args.verify else None,
-        "base": args.base or git_head(workdir), "created_at": time.time(), "turn": 1,
+        "verify_timeout_s": args.verify_timeout,
+        "base": base, "created_at": time.time(), "turn": 1,
     }
+
+
+def cmd_dispatch(args: argparse.Namespace) -> None:
+    run = Run(args.id)
+    workdir = str(Path(args.workdir).resolve())
+    if not Path(workdir).is_dir():
+        sys.exit(f"hsa: workdir {workdir} does not exist")
+    brief = read_brief(args.brief)
+    if args.verify and not Path(args.verify).is_file():
+        sys.exit(f"hsa: verify script {args.verify} not found")
+    base = args.base or git_head(workdir)
+    prompt = build_prompt(brief, not args.no_preamble, args.id, workdir, base)
+    check_prompt_size(prompt)
+    busy = busy_workers(workdir, args.id)
+    if busy and not args.share_workdir:
+        sys.exit(f"hsa: {workdir} already has a running worker ({', '.join(busy)}); "
+                 "give each worker its own worktree (`hsa worktree`) or pass --share-workdir")
+    if is_broad_dir(workdir):
+        print(f"hsa: warning: {workdir} is a broad directory; give workers a dedicated worktree "
+              "(`hsa worktree`) — `hsa stop` will not sweep commands there", file=sys.stderr)
+    prepare_run_dir(run, args.force)
+    ignore_scratch(workdir)
+    shutil.copy(args.brief, run.dir / "brief.md")
+    meta = new_meta(args, workdir, base)
     run.save(meta)
-    launch_turn(run, meta, build_prompt(brief, not args.no_preamble, args.id, workdir), None)
+    launch_turn(run, meta, prompt, None)
     print(f"dispatched {args.id}: pid {meta['pid']}  workdir {workdir}  base {meta['base']}")
     print(f"run dir {run.dir}")
 
 
 def cmd_followup(args: argparse.Namespace) -> None:
     run = require_run(args.id)
-    meta = refresh_session(run, run.meta())
-    if turn_state(run, meta) == "running":
-        sys.exit(f"hsa: {args.id} is still running turn {meta['turn']}; wait or stop it first")
     message = Path(args.file).read_text() if args.file else args.message
     if not message:
         sys.exit("hsa: give a message or -f FILE")
-    if not meta.get("session_id"):
-        sys.exit(f"hsa: no Hermes session id recorded for {args.id}; cannot resume")
-    if is_ghost(meta, session_info(meta["session_id"])):
-        print(f"hsa: note: {args.id} is a ghost (its stopped turn still runs in the Hermes gateway); "
-              "this message is queued and runs after that turn ends", file=sys.stderr)
-    if args.budget:
-        meta["budget_s"] = args.budget
-    meta["turn"] += 1
     if not args.raw:
         message += REPORT_REMINDER
-    launch_turn(run, meta, message, meta["session_id"])
+    check_prompt_size(message)
+    with run.launch_lock():
+        meta = refresh_session(run, run.meta())
+        if turn_state(run, meta) in ACTIVE_STATES:
+            sys.exit(f"hsa: {args.id} is still running turn {meta.get('turn', 1)}; wait or stop it first")
+        if not meta.get("session_id"):
+            sys.exit(f"hsa: no Hermes session id recorded for {args.id}; cannot resume")
+        if is_ghost(meta, session_info(meta["session_id"])):
+            print(f"hsa: note: {args.id} is a ghost (its stopped turn still runs in the Hermes gateway); "
+                  "this message is queued and runs after that turn ends", file=sys.stderr)
+        if args.budget:
+            meta["budget_s"] = args.budget
+        meta["turn"] = meta.get("turn", 1) + 1
+        launch_turn(run, meta, message, meta["session_id"])
     print(f"follow-up turn {meta['turn']} for {args.id}: pid {meta['pid']} session {meta['session_id']}")
 
 
 # ------------------------------------------------------------------ observing
-def all_runs() -> list[Run]:
+def all_run_metas() -> list[tuple[Run, dict]]:
+    """Every run with a readable meta.json. Directories that aren't run ids (like `_doctor`) are skipped, and
+    a corrupt meta.json gets one warning instead of taking every command down."""
     if not RUNS_DIR.exists():
         return []
-    return [Run(p.name) for p in sorted(RUNS_DIR.iterdir()) if (p / "meta.json").exists()]
+    found = []
+    for path in sorted(RUNS_DIR.iterdir()):
+        if not RUN_ID_RE.fullmatch(path.name) or not (path / "meta.json").exists():
+            continue
+        run = Run(path.name)
+        try:
+            meta = run.meta()
+            if not isinstance(meta, dict):
+                raise ValueError("not a JSON object")
+        except (OSError, ValueError) as err:
+            warn_once(f"bad-meta-{path.name}", f"hsa: warning: skipping run {path.name}: unreadable meta.json ({err})")
+            continue
+        found.append((run, meta))
+    return found
+
+
+def all_runs() -> list[Run]:
+    return [run for run, _ in all_run_metas()]
 
 
 def fmt_age(seconds: float | None) -> str:
@@ -347,19 +505,26 @@ def is_ghost(meta: dict, info: dict) -> bool:
     return bool(stopped_at and last and not info.get("ended_at") and last > stopped_at + GHOST_AFTER_S)
 
 
+def effective_state(run: Run, meta: dict) -> str:
+    """turn_state, with a stopped turn that keeps running server-side reported as 'ghost'."""
+    state = turn_state(run, meta)
+    if state == "stopped" and is_ghost(meta, session_info(meta.get("session_id"))):
+        return "ghost"
+    return state
+
+
 def run_summary(run: Run) -> dict:
     meta = refresh_session(run, run.meta())
-    state = turn_state(run, meta)
+    state = effective_state(run, meta)
     info = session_info(meta.get("session_id"))
-    if state == "stopped" and is_ghost(meta, info):
-        state = "ghost"
-    end = run.done_marker(meta["turn"])
-    finished = float(end.read_text().split()[1]) if end.exists() else time.time()
+    marker = read_marker(run.done_marker(meta.get("turn", 1)))
+    started = meta.get("turn_started_at")
+    finished = marker[1] if marker else time.time()
     last = info.get("last_activity_at")
-    return {"id": run.id, "state": state, "turn": meta["turn"], "api_calls": info.get("api_calls"),
-            "tools": info.get("tool_calls"), "elapsed": fmt_age(finished - meta["turn_started_at"]),
+    return {"id": run.id, "state": state, "turn": meta.get("turn", 1), "api_calls": info.get("api_calls"),
+            "tools": info.get("tool_calls"), "elapsed": fmt_age(finished - started if started else None),
             "idle": fmt_age(time.time() - last) if (last and state == "running") else "-",
-            "activity": (info.get("last_activity") or "")[:60], "workdir": meta["workdir"]}
+            "activity": (info.get("last_activity") or "")[:60], "workdir": meta.get("workdir", "")}
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -400,13 +565,26 @@ def cmd_tail(args: argparse.Namespace) -> None:
         print("no session yet (Hermes still starting up)")
         return
     for role, content, tool_name, tool_calls, ts in session_messages(sid, args.n):
-        print(f"{time.strftime('%H:%M:%S', time.localtime(ts))} {describe_message(role, content, tool_name, tool_calls)}")
+        stamp = time.strftime("%H:%M:%S", time.localtime(ts)) if ts is not None else "--:--:--"
+        print(f"{stamp} {describe_message(role, content, tool_name, tool_calls)}")
+
+
+def wait_deadline(runs: list[Run], timeout: int | None) -> float:
+    """--timeout seconds from now, else the latest budget end among the runs plus a margin, so a wait on a
+    wrapper that vanished without a marker can never hang forever."""
+    if timeout:
+        return time.time() + timeout
+    ends = []
+    for run in runs:
+        meta = run.meta()
+        ends.append((meta.get("turn_started_at") or time.time()) + (meta.get("budget_s") or DEFAULT_BUDGET_S) + WAIT_MARGIN_S)
+    return max(ends)
 
 
 def cmd_wait(args: argparse.Namespace) -> None:
     """Block until all (or --any) named runs finish their current turn; prints a status line per change."""
     runs = [require_run(i) for i in args.ids]
-    deadline = time.time() + args.timeout if args.timeout else None
+    deadline = wait_deadline(runs, args.timeout)
     seen: dict[str, str] = {}
     while True:
         states = {r.id: turn_state(r, r.meta()) for r in runs}
@@ -414,11 +592,13 @@ def cmd_wait(args: argparse.Namespace) -> None:
             if seen.get(rid) != st:
                 print(f"{time.strftime('%H:%M:%S')} {rid}: {st}", flush=True)
         seen = states
-        finished = [rid for rid, st in states.items() if st != "running"]
+        finished = [rid for rid, st in states.items() if st not in ACTIVE_STATES]
         if (args.any and finished) or len(finished) == len(runs):
             return
-        if deadline and time.time() > deadline:
-            sys.exit(f"hsa wait: timeout; still running: {[r for r, s in states.items() if s == 'running']}")
+        if time.time() > deadline:
+            active = ", ".join(r for r, s in states.items() if s in ACTIVE_STATES)
+            sys.exit(f"hsa wait: timeout; still running: {active}" if args.timeout
+                     else f"hsa wait: {active} still running past budget + 10 min")
         time.sleep(POLL_S)
 
 
@@ -449,7 +629,7 @@ def signal_all(pids: list[int], sig: int) -> None:
     for pid in pids:
         try:
             os.kill(pid, sig)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             continue
 
 
@@ -501,23 +681,54 @@ def proc_started_at(pid: int) -> float:
     return boot + ticks / os.sysconf("SC_CLK_TCK")
 
 
+def proc_session_id(pid: int) -> str | None:
+    """The Hermes session a process belongs to: Hermes' terminal tool tags every command it runs with
+    HERMES_SESSION_ID in the environment."""
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    prefix = f"{SESSION_ENV}=".encode()
+    for item in environ.split(b"\0"):
+        if item.startswith(prefix):
+            return item[len(prefix):].decode(errors="replace")
+    return None
+
+
+def is_inside(path: str, directory: str) -> bool:
+    return path == directory or path.startswith(directory.rstrip("/") + "/")
+
+
+def has_repo_child(workdir: str) -> bool:
+    """A folder of repos: not a repo itself (submodule checkouts don't count) but with a repo child."""
+    if (Path(workdir) / ".git").exists():
+        return False
+    try:
+        return any((child / ".git").exists() for child in Path(workdir).iterdir() if child.is_dir())
+    except OSError:
+        return False
+
+
 def is_broad_dir(workdir: str) -> bool:
-    return workdir in {"/", str(Path.home())} or Path(workdir).parent == Path("/")
+    """/, $HOME, its ancestors, top-level dirs, and folders of repos: places where unrelated work lives."""
+    home = str(Path.home())
+    return (workdir in {"/", home} or is_inside(home, workdir) or Path(workdir).parent == Path("/")
+            or has_repo_child(workdir))
 
 
-def hermes_spawned_in(workdir: str, since: float) -> list[int]:
-    """Commands Hermes runs for this worker outside the client's tree (a Hermes gateway runs one-shot tools
-    itself): processes started during this turn, whose cwd is inside the worker's workdir and that descend
-    from a process named exactly `hermes`. Never hsa itself or its ancestors; never for broad workdirs
-    ($HOME, /, top-level dirs), where unrelated Hermes jobs of the user could match."""
-    if is_broad_dir(workdir):
-        return []
-    protected = {os.getpid(), *ancestors(os.getpid())}
+def protected_pids() -> set[int]:
+    return {os.getpid(), *ancestors(os.getpid())}
+
+
+def hermes_spawned_in(workdir: str, since: float, skip_dirs: tuple[str, ...] = ()) -> list[int]:
+    """Fallback sweep when the session id is unknown: processes started during this turn, whose cwd is inside
+    the worker's workdir (but not inside `skip_dirs`) and that descend from a process named exactly `hermes`."""
+    protected = protected_pids()
     found = []
     for entry in Path("/proc").glob("[0-9]*"):
         pid = int(entry.name)
         cwd = proc_cwd(pid)
-        if pid in protected or not (cwd == workdir or cwd.startswith(workdir + "/")):
+        if pid in protected or not is_inside(cwd, workdir) or any(is_inside(cwd, d) for d in skip_dirs):
             continue
         if proc_started_at(pid) + START_TIME_SLACK_S < since:
             continue
@@ -526,30 +737,142 @@ def hermes_spawned_in(workdir: str, since: float) -> list[int]:
     return found
 
 
-def cmd_stop(args: argparse.Namespace) -> None:
-    """SIGINT first (Hermes' own Ctrl+C path interrupts the turn, including one hosted by a gateway),
-    then SIGTERM, then SIGKILL, applied to the wrapper's whole process tree."""
-    run = require_run(args.id)
-    meta = run.meta()
-    pid = meta.get("pid")
-    if not pid_alive(pid):
-        print(f"{args.id}: not running")
-        return
-    meta = run.patch({"stopped": True, "stopped_at": time.time()})
+def session_commands(sid: str, workdir: str, since: float) -> list[int]:
+    """Commands Hermes ran for session `sid`: tagged with it, cwd in the workdir, started since the run began.
+    The cwd and age checks exclude the gateway's own helpers, which can carry a stale session tag."""
+    protected = protected_pids()
+    found = []
+    for entry in Path("/proc").glob("[0-9]*"):
+        pid = int(entry.name)
+        if pid in protected or not is_inside(proc_cwd(pid), workdir):
+            continue
+        if proc_started_at(pid) + START_TIME_SLACK_S < since:
+            continue
+        if proc_session_id(pid) == sid:
+            found.append(pid)
+    return found
+
+
+def proc_cmdline(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode(errors="replace") for part in raw.split(b"\0")]
+
+
+def gateway_cwd_inside(workdir: str) -> int | None:
+    """Pid of a running Hermes gateway whose cwd is in the workdir: its helper processes inherit that cwd
+    (and may carry a stale session tag), so the workdir can't be swept safely."""
+    for entry in Path("/proc").glob("[0-9]*"):
+        pid = int(entry.name)
+        if proc_comm(pid) == HERMES_PROCESS_NAME and "gateway" in proc_cmdline(pid)[1:] \
+                and is_inside(proc_cwd(pid), workdir):
+            return pid
+    return None
+
+
+def no_sweep_reason(workdir: str) -> str | None:
+    if is_broad_dir(workdir):
+        return f"{workdir} is a broad directory"
+    gateway = gateway_cwd_inside(workdir)
+    if gateway:
+        return f"a Hermes gateway (pid {gateway}) runs inside {workdir}"
+    home = str(HERMES_HOME.resolve())
+    if is_inside(home, workdir):
+        return f"{workdir} is or contains the Hermes home"
+    return None
+
+
+def peer_workdirs(run: Run) -> list[tuple[str, str]]:
+    """(workdir, state) of every other run that is not finished cleanly."""
+    states = [(m.get("workdir", ""), turn_state(r, m)) for r, m in all_run_metas() if r.id != run.id]
+    return [(workdir, state) for workdir, state in states if state != "done"]
+
+
+def pick_sweep(run: Run, meta: dict, killed_client: bool) -> tuple[list[int], str]:
+    """Processes to kill after the client is dealt with, and how to describe the result. The cwd heuristic
+    relies on the current turn's start time, so it only runs when a live client was just killed."""
+    workdir = meta.get("workdir", "")
+    reason = no_sweep_reason(workdir)
+    if reason:
+        return [], f"no sweep: {reason}"
+    sid = meta.get("session_id")
+    since = meta.get("created_at") or meta.get("turn_started_at") or 0
+    if sid:
+        pids = session_commands(sid, workdir, since)
+        return pids, f"swept {len(pids)} commands tagged with session {sid}"
+    if not killed_client:
+        return [], "no sweep: session id unknown and no live client to anchor a cwd heuristic"
+    peers = peer_workdirs(run)
+    if any(is_inside(workdir, other) for other, _ in peers if other):
+        return [], "no sweep: session id unknown and another unfinished run shares this workdir"
+    nested = tuple(other for other, _ in peers if other and other != workdir and is_inside(other, workdir))
+    pids = hermes_spawned_in(workdir, meta.get("turn_started_at") or 0, nested)
+    return pids, f"swept {len(pids)} commands (cwd heuristic: session id unknown)"
+
+
+def write_stop_marker(marker: Path) -> None:
+    """Create the done marker for a stopped turn without clobbering one the wrapper wrote meanwhile."""
+    tmp = marker.with_name(f"{marker.name}.stop{os.getpid()}")
+    tmp.write_text(f"{STOPPED_RC} {int(time.time())}\n")
+    try:
+        os.link(tmp, marker)
+    except FileExistsError:
+        pass
+    finally:
+        tmp.unlink()
+
+
+def kill_client_tree(pid: int) -> tuple[int, int]:
+    """SIGINT (Hermes' own Ctrl+C path), then SIGTERM, then SIGKILL on the wrapper's whole process tree.
+    Returns (tree size, processes that needed SIGKILL)."""
     tree = process_tree(pid)
     signal_all(tree[1:], signal.SIGINT)
     survivors = wait_gone(tree, INTERRUPT_GRACE_S)
     signal_all(survivors, signal.SIGTERM)
     survivors = wait_gone(survivors, STOP_GRACE_S)
     signal_all(survivors, signal.SIGKILL)
-    spawned = hermes_spawned_in(meta["workdir"], meta["turn_started_at"])
-    signal_all(spawned, signal.SIGTERM)
-    signal_all(wait_gone(spawned, STOP_GRACE_S), signal.SIGKILL)
-    marker = run.done_marker(meta["turn"])
-    if not marker.exists():
-        marker.write_text(f"{STOPPED_RC} {int(time.time())}\n")
-    print(f"{args.id}: stopped {len(tree)} client processes ({len(survivors)} needed SIGKILL), "
-          f"{len(spawned)} Hermes-spawned commands in the workdir. "
+    return len(tree), len(survivors)
+
+
+def mark_stopped(run: Run, marker: Path) -> bool:
+    """Flag the turn stopped unless it finished meanwhile; True when flagged."""
+    flagged = []
+
+    def change(fresh: dict) -> None:
+        if not marker.exists():
+            fresh.update(stopped=True, stopped_at=time.time())
+            flagged.append(True)
+
+    run.patch(change)
+    return bool(flagged)
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    """Stop a worker. Also usable on a finished or crashed run: a ghost turn on a gateway keeps running and
+    may restart commands, so the session-tagged sweep runs in every case."""
+    run = require_run(args.id)
+    meta = run.meta()
+    marker = run.done_marker(meta.get("turn", 1))
+    killed = False
+    if marker.exists():
+        case = "client not running (turn already finished)"
+    elif not mark_stopped(run, marker):
+        case = "client not running (turn already finished)"
+    elif is_wrapper(meta):
+        tree_size, needed_kill = kill_client_tree(meta["pid"])
+        killed = True
+        case = f"stopped {tree_size} client processes ({needed_kill} needed SIGKILL)"
+        write_stop_marker(marker)
+    else:
+        case = "client not running (marked stopped)"
+        write_stop_marker(marker)
+    meta = refresh_session(run, run.meta())
+    swept, how = pick_sweep(run, meta, killed)
+    signal_all(swept, signal.SIGTERM)
+    signal_all(wait_gone(swept, STOP_GRACE_S), signal.SIGKILL)
+    print(f"{args.id}: {case}; {len(swept)} Hermes-spawned commands in the workdir ({how}). "
           f"`hsa status {args.id}` shows 'ghost' if the Hermes session keeps running server-side.")
 
 
@@ -577,13 +900,40 @@ def run_verify(run: Run, meta: dict) -> tuple[int, str]:
     script = meta.get("verify")
     if not script:
         return 0, "(no verify script)"
-    proc = subprocess.run(["bash", script], cwd=meta["workdir"], capture_output=True, text=True,
-                          env={**os.environ, "HSA_WORKDIR": meta["workdir"], "HSA_BASE": meta.get("base") or ""})
-    output = (proc.stdout + proc.stderr)[-6000:]
-    record = {"turn": meta["turn"], "rc": proc.returncode, "at": time.time()}
+    if not Path(script).is_file():
+        return VERIFY_MISSING_RC, f"(verify script {script} not found)"
+    turn = meta.get("turn", 1)
+    rc, output = run_script(script, meta, run.turn_file(turn, "verify"))
+    record = {"turn": turn, "rc": rc, "at": time.time()}
     meta.update(run.patch(lambda fresh: fresh.update(verifications=[*fresh.get("verifications", []), record])))
-    run.turn_file(meta["turn"], "verify").write_text(output)
-    return proc.returncode, output
+    run.turn_file(turn, "verify").write_text(output)
+    return rc, output
+
+
+def tail_of(path: Path) -> str:
+    try:
+        return path.read_bytes()[-SCRIPT_OUTPUT_TAIL:].decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def run_script(script: str, meta: dict, out_path: Path) -> tuple[int, str]:
+    """Run the acceptance script with no stdin and a time limit. Output goes to a file, not pipes, so a
+    daemon the script leaves behind can neither block us nor turn a passing script into a timeout; only the
+    script itself is waited for, and a timeout kills its whole process group."""
+    limit = meta.get("verify_timeout_s", DEFAULT_VERIFY_TIMEOUT_S)
+    with open(out_path, "wb") as out:
+        proc = subprocess.Popen(["bash", script], cwd=meta["workdir"], stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT, start_new_session=True,
+                                env={**os.environ, "HSA_WORKDIR": meta["workdir"], "HSA_BASE": meta.get("base") or ""})
+        try:
+            proc.wait(timeout=limit)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            return VERIFY_TIMEOUT_RC, f"(verify timed out after {limit} s)\n" + tail_of(out_path)
+    return proc.returncode, tail_of(out_path)
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -611,30 +961,49 @@ Find the root cause, fix it in the same working directory, re-run the check your
 (put the passing check output under ACCEPTANCE). If you are blocked, explain exactly what blocks you."""
 
 
+def loop_fail(message: str, code: int) -> None:
+    print(message, file=sys.stderr if code == 2 else sys.stdout)
+    sys.exit(code)
+
+
 def cmd_loop(args: argparse.Namespace) -> None:
-    """wait -> verify -> (on fail) follow-up with the failure, up to --max-fixes rounds. Zero orchestrator tokens."""
+    """wait -> verify -> (on fail) follow-up with the failure, up to --max-fixes rounds. Zero orchestrator tokens.
+    A stopped worker ends the loop (it was stopped on purpose); a crash is retried once."""
     run = require_run(args.id)
+    if not run.meta().get("verify"):
+        loop_fail(f"hsa loop: {args.id} has no verify script (dispatch with --verify)", 2)
+    crashes = 0
     for attempt in range(args.max_fixes + 1):
         cmd_wait(argparse.Namespace(ids=[args.id], any=False, timeout=None))
         meta = refresh_session(run, run.meta())
-        state = turn_state(run, meta)
+        state = effective_state(run, meta)
+        if state in ("stopped", "ghost"):
+            loop_fail(f"turn {meta['turn']} state={state}: stopped on purpose, not sending a follow-up", 2)
         rc, output = run_verify(run, meta)
+        if rc == VERIFY_MISSING_RC and not Path(meta["verify"]).is_file():
+            loop_fail(f"verify script {meta['verify']} not found", 2)
         print(f"turn {meta['turn']} state={state} verify rc={rc}", flush=True)
         if rc == 0 and state == "done":
             print("LOOP PASS")
             return
+        if rc == 0 and state in ("crashed", "failed"):
+            print(f"LOOP PASS (verify passed; worker turn ended {state})")
+            return
+        crashes += state == "crashed"
+        if crashes > 1:
+            loop_fail("LOOP FAIL (crashed twice)", 1)
         if attempt == args.max_fixes:
             break
         msg = FIX_TEMPLATE.format(rc=rc, output=output[-3000:], script=meta["verify"], workdir=meta["workdir"])
         if state != "done":
             msg = f"Your previous turn ended with state '{state}' (not a clean finish).\n\n" + msg
         cmd_followup(argparse.Namespace(id=args.id, message=msg, file=None, budget=None, raw=False))
-    print("LOOP FAIL")
-    sys.exit(1)
+    loop_fail("LOOP FAIL", 1)
 
 
 # -------------------------------------------------------------------- review
 RED_FLAGS = ["console.log(", "dbg!(", "println!(\"debug", "TODO", "FIXME", "breakpoint()", "pdb.set_trace"]
+SCRATCH_PREFIX = ".hsa-tmp/"
 
 
 def added_lines(workdir: str, base: str) -> list[str]:
@@ -642,22 +1011,44 @@ def added_lines(workdir: str, base: str) -> list[str]:
     return [l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
 
 
+def untracked_lines(workdir: str) -> list[str]:
+    """Lines of untracked text files (new files are not in `git diff`); big or binary files are skipped."""
+    lines = []
+    for rel in git(workdir, "ls-files", "-o", "--exclude-standard", "-z").split("\0"):
+        path = Path(workdir) / rel
+        if not rel or rel.startswith(SCRATCH_PREFIX):
+            continue
+        try:
+            if not path.is_file() or path.stat().st_size > MAX_UNTRACKED_BYTES:
+                continue
+            lines.extend(path.read_text().splitlines())
+        except (OSError, UnicodeDecodeError):
+            continue
+    return lines
+
+
+def print_git_sections(meta: dict, base: str | None) -> None:
+    wd = meta.get("workdir")
+    if not wd:
+        return
+    if base:
+        print("== commits\n" + (git(wd, "log", "--oneline", f"{base}..HEAD") or "(none)"))
+        print("== diffstat (base..worktree)\n" + (git(wd, "diff", "--stat", base) or "(no changes)"))
+        lines = added_lines(wd, base) + untracked_lines(wd)
+        flags = sorted({f for line in lines for f in RED_FLAGS if f in line})
+        print("== red flags in added lines: " + (", ".join(flags) or "none"))
+    print("== uncommitted\n" + (git(wd, "status", "--short") or "(clean)"))
+
+
 def cmd_review(args: argparse.Namespace) -> None:
     """One compact packet for the orchestrator: outcome, usage, commits, diffstat, flags, final report."""
     run = require_run(args.id)
     meta = refresh_session(run, run.meta())
-    wd, base, turn = meta["workdir"], args.base or meta.get("base"), meta["turn"]
-    usage = {}
-    if run.turn_file(turn, "usage").exists():
-        usage = json.loads(run.turn_file(turn, "usage").read_text() or "{}")
+    turn = meta.get("turn", 1)
+    usage = read_usage(run, turn)
     print(f"== {args.id}  state={turn_state(run, meta)}  turn={turn}  exit={usage.get('turn_exit_reason')}"
           f"  calls={usage.get('api_calls')}  failed={usage.get('failed')}")
-    if base:
-        print("== commits\n" + (git(wd, "log", "--oneline", f"{base}..HEAD") or "(none)"))
-        print("== diffstat (base..worktree)\n" + (git(wd, "diff", "--stat", base) or "(no changes)"))
-        flags = sorted({f for line in added_lines(wd, base) for f in RED_FLAGS if f in line})
-        print("== red flags in added lines: " + (", ".join(flags) or "none"))
-    print("== uncommitted\n" + (git(wd, "status", "--short") or "(clean)"))
+    print_git_sections(meta, args.base or meta.get("base"))
     if meta.get("verifications"):
         print("== verify history: " + ", ".join(f"t{v['turn']}:rc{v['rc']}" for v in meta["verifications"]))
     report = latest_report(run, meta)
@@ -678,13 +1069,13 @@ def latest_report(run: Run, meta: dict) -> str:
     """The worker's structured report for the current turn. Usually the final answer; but Hermes configs with
     post-answer 'evidence' nudges can make the last message an evidence reply, so fall back to the newest
     assistant message of this turn that contains a STATUS: line."""
-    out_file = run.turn_file(meta["turn"], "out")
+    out_file = run.turn_file(meta.get("turn", 1), "out")
     out = out_file.read_text() if out_file.exists() else ""
     match = REPORT_START.search(out)
     if match and match.start() < REPORT_SEARCH_PREFIX:
         return out[match.start():].strip()
     for role, content, _tool, _calls, ts in reversed(session_messages(meta.get("session_id"), REPORT_SCAN_MESSAGES)):
-        if role != "assistant" or not content or ts < meta["turn_started_at"]:
+        if role != "assistant" or not content or (ts or 0) < (meta.get("turn_started_at") or 0):
             continue
         found = REPORT_START.search(content)
         if found:
@@ -699,20 +1090,27 @@ def cmd_report(args: argparse.Namespace) -> None:
 
 DOCTOR_PROBE_VALUE = "forwarded"
 DOCTOR_PROMPT = ("Run exactly this one shell command with your terminal tool, then reply with only its raw "
-                 "output and nothing else: echo \"probe=${HSA_DOCTOR_PROBE:-unset} ppid=$PPID\"")
+                 "output and nothing else: echo \"probe=${HSA_DOCTOR_PROBE:-unset} ppid=$PPID "
+                 "sid=${HERMES_SESSION_ID:-unset}\"")
 DOCTOR_PROBE_TIMEOUT_S = 900
-DOCTOR_LINE = re.compile(r"probe=(\S+) ppid=(\d+)")
+DOCTOR_VERSION_TIMEOUT_S = 120
+DOCTOR_LINE = re.compile(r"probe=(\S+) ppid=(\d+)(?: sid=(\S+))?")
 
 
-def doctor_static() -> bool:
+def doctor_static(timeout_s: int) -> bool:
     """Print setup checks that need no model call; True when a probe run can be attempted."""
     hermes = shutil.which(HERMES_BIN)
     print(f"hermes binary : {hermes or 'MISSING (install Hermes Agent or set HSA_HERMES_BIN)'}")
     if hermes:
-        proc = subprocess.run([HERMES_BIN, "--version"], capture_output=True, text=True, timeout=120)
-        print(f"hermes version: {(proc.stdout or proc.stderr).strip().splitlines()[0] if (proc.stdout or proc.stderr).strip() else '?'}")
+        try:
+            proc = subprocess.run([HERMES_BIN, "--version"], capture_output=True, text=True,
+                                  timeout=min(timeout_s, DOCTOR_VERSION_TIMEOUT_S))
+            text = (proc.stdout or proc.stderr).strip()
+            print(f"hermes version: {text.splitlines()[0] if text else '?'}")
+        except subprocess.TimeoutExpired:
+            print("hermes version: hermes --version timed out")
     db = HERMES_HOME / "state.db"
-    print(f"session store : {db} ({'readable' if state_db() is not None else 'not found: live tail/status/ghost detection off'})")
+    print(f"session store : {db} ({'readable' if db.exists() else 'not found: live tail/status/ghost detection off'})")
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"runs dir      : {RUNS_DIR} (writable)")
     return bool(hermes)
@@ -720,26 +1118,37 @@ def doctor_static() -> bool:
 
 def doctor_probe(timeout_s: int) -> None:
     """One tiny real run: latency, whether client env reaches tools, and where tool commands execute."""
-    probe_dir = RUNS_DIR / "_doctor" / time.strftime("%Y%m%d-%H%M%S")
+    probe_dir = RUNS_DIR / "_doctor" / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
     probe_dir.mkdir(parents=True)
     usage_file = probe_dir / "usage.json"
     argv = [HERMES_BIN, "-z", DOCTOR_PROMPT, "--in", str(probe_dir), "--yolo", "--reasoning", "low",
             "-t", "terminal", "--usage-file", str(usage_file)]
     started = time.time()
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
-                          env={**os.environ, "HSA_DOCTOR_PROBE": DOCTOR_PROBE_VALUE}, cwd=probe_dir)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
+                              env={**os.environ, "HSA_DOCTOR_PROBE": DOCTOR_PROBE_VALUE}, cwd=probe_dir)
+    except subprocess.TimeoutExpired:
+        print(f"probe run     : probe timed out after {timeout_s} s")
+        return
     elapsed = time.time() - started
-    usage = json.loads(usage_file.read_text()) if usage_file.exists() and usage_file.read_text().strip() else {}
+    usage = load_json_dict(usage_file)
     found = DOCTOR_LINE.search(proc.stdout)
     print(f"probe run     : rc={proc.returncode} in {elapsed:.0f}s, {usage.get('api_calls')} model calls, "
           f"model={usage.get('model')}")
     if not found:
         print("probe output  : unexpected; first lines:\n" + (proc.stdout or proc.stderr)[:600])
         return
+    print_probe_findings(found, usage)
+
+
+def print_probe_findings(found: re.Match, usage: dict) -> None:
     forwarded = found.group(1) == DOCTOR_PROBE_VALUE
     gateway = pid_alive(int(found.group(2)))
+    tagged = bool(found.group(3)) and found.group(3) != "unset" and found.group(3) == usage.get("session_id")
     print(f"env forwarded : {'yes' if forwarded else 'NO - env vars set by hsa (timeouts) do not reach workers'}")
     print(f"tool host     : {'Hermes gateway (long-lived process)' if gateway else 'the hermes client process'}")
+    print("session-tagged : " + ("yes (hsa stop kills exactly this worker's commands)" if tagged
+                                else "no (hsa stop falls back to a cwd heuristic)"))
     if gateway:
         print("=> gateway-hosted: `hsa stop` kills the client and the worker's commands, but a turn can continue")
         print("   server-side (status 'ghost'). Keep tasks small; let turns finish and correct them with follow-ups.")
@@ -750,7 +1159,7 @@ def doctor_probe(timeout_s: int) -> None:
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:
-    if doctor_static() and not args.no_probe:
+    if doctor_static(args.timeout) and not args.no_probe:
         doctor_probe(args.timeout)
 
 
@@ -775,6 +1184,8 @@ def parser() -> argparse.ArgumentParser:
     d.add_argument("--terminal-timeout", type=int, default=DEFAULT_TERMINAL_TIMEOUT_S,
                    help="Hermes foreground command timeout (default 1200 s); only effective when Hermes runs "
                         "turns in-process (see `hsa doctor`)")
+    d.add_argument("--verify-timeout", type=int, default=DEFAULT_VERIFY_TIMEOUT_S,
+                   help="kill the verify script after this many seconds (default 1800)")
     d.add_argument("--clean", action="store_true", help="--ignore-rules: no AGENTS.md/memory/skills injection")
     d.add_argument("--no-preamble", action="store_true", help="send the brief without the worker preamble")
     d.add_argument("--share-workdir", action="store_true", help="allow a second worker in a busy workdir")

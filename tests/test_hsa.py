@@ -296,3 +296,517 @@ def test_concurrent_status_never_rolls_back_a_followup_turn(env, tmp_path):
     assert meta["turn"] == 2 and len(meta["turns"]) == 2
     hsa(env, "wait", "t1", "--timeout", "30")
     assert "done" in hsa(env, "status", "t1").stdout
+
+
+# ------------------------------------------------------------ hardening tests
+def runs_dir(env) -> Path:
+    return Path(env["HSA_RUNS_DIR"])
+
+
+def read_meta(env, run_id) -> dict:
+    return json.loads((runs_dir(env) / run_id / "meta.json").read_text())
+
+
+def write_meta(env, run_id, **fields) -> Path:
+    run_dir = runs_dir(env) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "meta.json").write_text(json.dumps({"id": run_id, **fields}))
+    return run_dir
+
+
+def session_of(env, run_id, turn=1) -> str:
+    path = runs_dir(env) / run_id / f"turn-{turn}.usage"
+    wait_for_file(path)
+    return json.loads(path.read_text())["session_id"]
+
+
+def spawn_sleep(cwd, session=None) -> subprocess.Popen:
+    sleep_env = {k: v for k, v in os.environ.items() if k != "HERMES_SESSION_ID"}
+    if session:
+        sleep_env["HERMES_SESSION_ID"] = session
+    return subprocess.Popen(["sleep", "300"], cwd=cwd, env=sleep_env)
+
+
+def reap(*procs) -> None:
+    for proc in procs:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.parametrize("bad", [".", "..", "a/b", "_x", ".hidden", "x" * 65, ""])
+def test_dispatch_rejects_invalid_run_ids(env, tmp_path, bad):
+    wd = make_repo(tmp_path / "wd")
+    runs_dir(env).mkdir()
+    marker = runs_dir(env) / "keep.txt"
+    marker.write_text("x")
+    proc = hsa(env, "dispatch", bad, str(wd), brief(tmp_path), "--force", check=False)
+    assert proc.returncode != 0 and "invalid run id" in proc.stderr
+    assert marker.exists()
+
+
+def test_status_skips_non_run_dirs_and_corrupt_meta(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa(env, "dispatch", "good", str(wd), brief(tmp_path))
+    hsa(env, "wait", "good", "--timeout", "30")
+    write_meta(env, "_doctor", turn=1)
+    bad = runs_dir(env) / "bad"
+    bad.mkdir()
+    (bad / "meta.json").write_text("{not json")
+    proc = hsa(env, "status")
+    assert "good" in proc.stdout and "bad" not in proc.stdout.replace("bad-", "") and "_doctor" not in proc.stdout
+    assert proc.stderr.count("bad") == 1
+
+
+def test_dispatch_checks_inputs_before_touching_run_dir(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    missing = hsa(env, "dispatch", "t1", str(wd), str(tmp_path / "nope.md"), check=False)
+    assert missing.returncode != 0 and "brief" in missing.stderr
+    no_verify = hsa(env, "dispatch", "t1", str(wd), brief(tmp_path), "--verify", str(tmp_path / "nope.sh"), check=False)
+    assert no_verify.returncode != 0 and "verify" in no_verify.stderr
+    huge = hsa(env, "dispatch", "t1", str(wd), brief(tmp_path, "x" * 120_000), check=False)
+    assert huge.returncode != 0 and "128 KiB" in huge.stderr
+    assert not (runs_dir(env) / "t1").exists()
+
+
+def test_followup_refuses_oversized_prompt(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path))
+    hsa(env, "wait", "t1", "--timeout", "30")
+    proc = hsa(env, "followup", "t1", "y" * 120_000, check=False)
+    assert proc.returncode != 0 and "128 KiB" in proc.stderr
+    assert read_meta(env, "t1")["turn"] == 1
+
+
+def test_force_refuses_running_run_and_foreign_dirs(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa({**env, "FAKE_HERMES_SLEEP": "60"}, "dispatch", "t1", str(wd), brief(tmp_path))
+    try:
+        proc = hsa(env, "dispatch", "t1", str(wd), brief(tmp_path), "--force", check=False)
+        assert proc.returncode != 0 and "running" in proc.stderr
+    finally:
+        hsa(env, "stop", "t1")
+    foreign = runs_dir(env) / "foreign"
+    foreign.mkdir()
+    (foreign / "precious.txt").write_text("keep")
+    other = make_repo(tmp_path / "wd2")
+    proc = hsa(env, "dispatch", "foreign", str(other), brief(tmp_path), "--force", check=False)
+    assert proc.returncode != 0 and "not an hsa run dir" in proc.stderr
+    assert (foreign / "precious.txt").exists()
+    (foreign / "precious.txt").unlink()
+    hsa(env, "dispatch", "foreign", str(other), brief(tmp_path))
+    hsa(env, "wait", "foreign", "--timeout", "30")
+
+
+def test_prompt_header_names_base_commit_and_meta_has_verify_timeout(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    head = subprocess.run(["git", "-C", str(wd), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path), "--verify-timeout", "7")
+    hsa(env, "wait", "t1", "--timeout", "30")
+    assert f"Base commit: {head}" in calls(wd)[0][1]
+    assert read_meta(env, "t1")["verify_timeout_s"] == 7
+
+
+def test_stop_sweep_uses_session_tag_and_spares_everything_else(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    hsa({**env, "FAKE_HERMES_SLEEP": "60", "FAKE_HERMES_EARLY_USAGE": "1"}, "dispatch", "t1", str(wd), brief(tmp_path))
+    sid = session_of(env, "t1")
+    tagged, helper, other_worker, untagged = (spawn_sleep(wd, sid), spawn_sleep(outside, sid),
+                                              spawn_sleep(wd, "someone-else"), spawn_sleep(wd))
+    try:
+        out = hsa(env, "stop", "t1").stdout
+        time.sleep(1)
+        assert f"swept 1 commands tagged with session {sid}" in out
+        assert not alive(tagged.pid)
+        assert alive(helper.pid) and alive(other_worker.pid) and alive(untagged.pid)
+    finally:
+        reap(tagged, helper, other_worker, untagged)
+
+
+def test_stop_fallback_skipped_when_workdir_is_shared(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    slow = {**env, "FAKE_HERMES_SLEEP": "60"}
+    hsa(slow, "dispatch", "a", str(wd), brief(tmp_path))
+    hsa(slow, "dispatch", "b", str(wd), brief(tmp_path), "--share-workdir")
+    gateway = start_fake_gateway(tmp_path, wd)
+    try:
+        wait_for_file(tmp_path / "gw" / "child.pid")
+        child = int((tmp_path / "gw" / "child.pid").read_text())
+        out = hsa(env, "stop", "a").stdout
+        time.sleep(1)
+        assert "no sweep" in out and alive(child)
+    finally:
+        reap(gateway)
+        hsa(env, "stop", "b")
+        os.kill(child, 9)
+
+
+def test_broad_directories_are_never_swept(env, tmp_path):
+    home = tmp_path / "home"
+    wd = home / "src"
+    make_repo(wd / "one")
+    make_repo(wd / "two")
+    hsa({**env, "HOME": str(home), "FAKE_HERMES_SLEEP": "60"}, "dispatch", "t1", str(wd), brief(tmp_path))
+    out = hsa({**env, "HOME": str(home)}, "stop", "t1").stdout
+    assert "no sweep" in out and "broad" in out
+
+
+def test_repo_with_submodule_checkout_is_not_broad(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    (wd / "sub").mkdir()
+    (wd / "sub" / ".git").write_text("gitdir: ../.git/modules/sub\n")
+    proc = hsa(env, "dispatch", "t1", str(wd), brief(tmp_path))
+    hsa(env, "wait", "t1", "--timeout", "30")
+    assert "broad" not in proc.stderr
+
+
+def test_state_of_run_whose_pid_was_reused_is_crashed(env, tmp_path):
+    imposter = subprocess.Popen(["sleep", "300"])
+    try:
+        write_meta(env, "t1", workdir=str(tmp_path), turn=1, pid=imposter.pid,
+                   turn_started_at=time.time() - 1000, budget_s=60)
+        rows = json.loads(hsa(env, "status", "--json").stdout)
+        assert rows[0]["state"] == "crashed"
+    finally:
+        reap(imposter)
+
+
+def test_stop_never_signals_finished_turn_or_reused_pid(env, tmp_path):
+    imposter = subprocess.Popen(["sleep", "300"])
+    try:
+        run_dir = write_meta(env, "t1", workdir=str(tmp_path), turn=1, pid=imposter.pid,
+                             turn_started_at=time.time(), budget_s=60)
+        (run_dir / "turn-1.done").write_text("0 1\n")
+        out = hsa(env, "stop", "t1").stdout
+        assert "not running" in out and alive(imposter.pid)
+        assert "stopped" not in read_meta(env, "t1") or not read_meta(env, "t1")["stopped"]
+    finally:
+        reap(imposter)
+
+
+def test_wait_without_timeout_gives_up_past_budget(env, tmp_path):
+    runner = subprocess.Popen(["bash", "-c", "sleep 300; true"], start_new_session=True)
+    try:
+        time.sleep(0.3)
+        started = time.time()
+        write_meta(env, "t1", workdir=str(tmp_path), turn=1, pid=runner.pid, turn_started_at=started, budget_s=-700)
+        proc = hsa(env, "wait", "t1", check=False)
+        assert proc.returncode != 0 and "still running past budget + 10 min" in proc.stderr
+    finally:
+        os.killpg(runner.pid, 9)
+        runner.wait()
+
+
+def test_loop_requires_verify_script(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path))
+    proc = hsa(env, "loop", "t1", check=False)
+    assert proc.returncode == 2 and "no verify script" in proc.stderr
+
+
+def test_loop_does_not_restart_a_stopped_worker(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    verify = tmp_path / "verify.sh"
+    verify.write_text("exit 1\n")
+    hsa({**env, "FAKE_HERMES_SLEEP": "60"}, "dispatch", "t1", str(wd), brief(tmp_path), "--verify", str(verify))
+    hsa(env, "stop", "t1")
+    proc = hsa(env, "loop", "t1", check=False)
+    assert proc.returncode == 2 and "stopped" in proc.stdout
+    assert len(calls(wd)) == 1
+
+
+def test_loop_retries_one_crash_then_fails(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    verify = tmp_path / "verify.sh"
+    verify.write_text("exit 1\n")
+    crashing = {**env, "FAKE_HERMES_CRASH": "1"}
+    hsa(crashing, "dispatch", "t1", str(wd), brief(tmp_path), "--verify", str(verify))
+    proc = hsa(crashing, "loop", "t1", "--max-fixes", "3", check=False)
+    assert proc.returncode == 1 and "LOOP FAIL (crashed twice)" in proc.stdout
+    assert len(calls(wd)) == 2
+
+
+def test_verify_timeout_reports_rc_124(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    verify = tmp_path / "verify.sh"
+    verify.write_text("echo partial; sleep 30\n")
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path), "--verify", str(verify), "--verify-timeout", "1")
+    proc = hsa(env, "verify", "t1", check=False)
+    assert proc.returncode == 124 and "verify timed out after 1 s" in proc.stdout and "partial" in proc.stdout
+
+
+def test_loop_exits_2_when_verify_script_vanishes(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    verify = tmp_path / "verify.sh"
+    verify.write_text("exit 1\n")
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path), "--verify", str(verify))
+    hsa(env, "wait", "t1", "--timeout", "30")
+    verify.unlink()
+    proc = hsa(env, "loop", "t1", check=False)
+    assert proc.returncode == 2 and "not found" in proc.stderr
+    assert len(calls(wd)) == 1
+
+
+def make_state_db(home: Path, sessions_cwd=None, started_at=0.0, ids=()) -> None:
+    home.mkdir(exist_ok=True)
+    db = sqlite3.connect(home / "state.db")
+    db.execute("create table sessions (id text, cwd text, started_at real, api_call_count int, tool_call_count int,"
+               " input_tokens int, output_tokens int, last_activity_at real, last_activity_description text,"
+               " ended_at real, end_reason text)")
+    for sid in ids:
+        db.execute("insert into sessions (id, cwd, started_at) values (?,?,?)", (sid, sessions_cwd, started_at))
+    db.commit()
+    db.close()
+
+
+def test_session_id_ambiguous_state_db_is_not_guessed(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    write_meta(env, "t1", workdir=str(wd), turn=1, pid=0, turn_started_at=time.time() - 10, budget_s=60)
+    make_state_db(Path(env["HERMES_HOME"]), str(wd), time.time(), ["s1", "s2"])
+    proc = hsa(env, "status", "t1")
+    assert "session_id" not in read_meta(env, "t1") and "not guessing" in proc.stderr
+    assert proc.stderr.count("not guessing") == 1
+
+
+def test_usage_session_id_overrides_state_db_guess(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    run_dir = write_meta(env, "t1", workdir=str(wd), turn=1, pid=0, turn_started_at=time.time() - 10, budget_s=60)
+    make_state_db(Path(env["HERMES_HOME"]), str(wd), time.time(), ["guess"])
+    hsa(env, "status", "t1")
+    assert read_meta(env, "t1")["session_id"] == "guess"
+    (run_dir / "turn-1.usage").write_text(json.dumps({"session_id": "real"}))
+    hsa(env, "status", "t1")
+    meta = read_meta(env, "t1")
+    assert meta["session_id"] == "real" and meta["session_source"] == "usage"
+
+
+def test_concurrent_followups_launch_one_turn(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path))
+    hsa(env, "wait", "t1", "--timeout", "30")
+    slow = {**env, "FAKE_HERMES_SLEEP": "6"}
+    procs = [subprocess.Popen([sys.executable, str(HSA), "followup", "t1", "go"], env=slow,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+    results = [(p.wait(timeout=60), p.stderr.read()) for p in procs]
+    codes = sorted(rc for rc, _ in results)
+    assert codes[0] == 0 and codes[1] != 0
+    assert any("still running" in err for _, err in results)
+    assert [t["turn"] for t in read_meta(env, "t1")["turns"]] == [1, 2]
+    hsa(env, "stop", "t1")
+
+
+def test_unreadable_state_db_degrades_to_one_warning(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path))
+    hsa(env, "wait", "t1", "--timeout", "30")
+    home = Path(env["HERMES_HOME"])
+    home.mkdir()
+    sqlite3.connect(home / "state.db").execute("create table unrelated (x int)").connection.close()
+    for cmd in ("status", "tail", "review"):
+        proc = hsa(env, cmd, "t1")
+        assert proc.stderr.count("cannot read Hermes state.db") <= 1
+    assert "cannot read Hermes state.db" in hsa(env, "tail", "t1").stderr
+
+
+@pytest.mark.parametrize("content", ["", "[]", "{broken"])
+def test_bad_usage_files_are_tolerated(env, tmp_path, content):
+    wd = make_repo(tmp_path / "wd")
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path))
+    hsa(env, "wait", "t1", "--timeout", "30")
+    (runs_dir(env) / "t1" / "turn-1.usage").write_text(content)
+    meta_path = runs_dir(env) / "t1" / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta.pop("session_id", None)
+    meta.pop("session_source", None)
+    meta_path.write_text(json.dumps(meta))
+    for cmd in ("status", "review", "report", "tail"):
+        hsa(env, cmd, "t1")
+
+
+def test_garbled_done_marker_counts_as_failed(env, tmp_path):
+    run_dir = write_meta(env, "t1", workdir=str(tmp_path), turn=1, pid=0, turn_started_at=time.time(), budget_s=60)
+    (run_dir / "turn-1.done").write_text("")
+    assert json.loads(hsa(env, "status", "--json").stdout)[0]["state"] == "failed"
+    (run_dir / "turn-1.done").write_text("garbage\n")
+    assert json.loads(hsa(env, "status", "--json").stdout)[0]["state"] == "failed"
+
+
+def test_stop_keeps_wrappers_marker_and_skips_finished_turns(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path))
+    hsa(env, "wait", "t1", "--timeout", "30")
+    out = hsa(env, "stop", "t1").stdout
+    assert "not running" in out
+    assert (runs_dir(env) / "t1" / "turn-1.done").read_text().startswith("0 ")
+
+
+def test_followup_after_stop_clears_stopped_flags(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa({**env, "FAKE_HERMES_SLEEP": "60", "FAKE_HERMES_EARLY_USAGE": "1"}, "dispatch", "t1", str(wd), brief(tmp_path))
+    session_of(env, "t1")
+    hsa(env, "stop", "t1")
+    assert read_meta(env, "t1")["stopped"] and "stopped_at" in read_meta(env, "t1")
+    hsa(env, "followup", "t1", "again")
+    meta = read_meta(env, "t1")
+    assert meta["stopped"] is False and "stopped_at" not in meta
+    hsa(env, "wait", "t1", "--timeout", "30")
+
+
+def test_minimal_meta_never_raises_keyerror(env, tmp_path):
+    write_meta(env, "t1", turn=1)
+    for cmd in ("status", "review", "report", "tail"):
+        proc = hsa(env, cmd, "t1")
+        assert "Traceback" not in proc.stderr
+    assert "-" in hsa(env, "status", "t1").stdout
+
+
+def test_tail_prints_placeholder_for_missing_timestamp(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path))
+    hsa(env, "wait", "t1", "--timeout", "30")
+    sid = session_of(env, "t1")
+    home = Path(env["HERMES_HOME"])
+    make_state_db(home)
+    db = sqlite3.connect(home / "state.db")
+    db.execute("create table messages (id integer primary key, session_id text, role text, content text,"
+               " tool_name text, tool_calls text, timestamp real)")
+    db.execute("insert into messages (session_id, role, content, timestamp) values (?,?,?,NULL)", (sid, "user", "hi"))
+    db.commit()
+    db.close()
+    assert "--:--:-- USER: hi" in hsa(env, "tail", "t1").stdout
+
+
+def slow_hermes(tmp_path) -> str:
+    fake = tmp_path / "slow-hermes"
+    fake.write_text("#!/bin/sh\nsleep 30\n")
+    fake.chmod(0o755)
+    return str(fake)
+
+
+def test_doctor_timeouts_do_not_traceback(env, tmp_path):
+    proc = hsa({**env, "HSA_HERMES_BIN": slow_hermes(tmp_path)},
+               "doctor", "--timeout", "1", check=False)
+    assert "Traceback" not in proc.stderr
+    assert "hermes --version timed out" in proc.stdout and "probe timed out after 1 s" in proc.stdout
+
+
+def test_doctor_reports_session_tagging(env, tmp_path):
+    tagged = {**env, "FAKE_HERMES_SESSION": "sess-42", "FAKE_HERMES_OUT": "probe=forwarded ppid=1 sid=sess-42"}
+    assert "session-tagged : yes" in hsa(tagged, "doctor", "--timeout", "60").stdout
+    untagged = {**env, "FAKE_HERMES_SESSION": "sess-42", "FAKE_HERMES_OUT": "probe=forwarded ppid=1 sid=unset"}
+    assert "session-tagged : no" in hsa(untagged, "doctor", "--timeout", "60").stdout
+
+
+def test_review_flags_untracked_files(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path))
+    hsa(env, "wait", "t1", "--timeout", "30")
+    (wd / "fake-calls.log").unlink()
+    assert "red flags in added lines: none" in hsa(env, "review", "t1").stdout
+    (wd / "new.py").write_text("x = 1  # TODO later\n")
+    (wd / ".hsa-tmp").mkdir()
+    (wd / ".hsa-tmp" / "scratch.txt").write_text("FIXME")
+    (wd / "blob.bin").write_bytes(b"\xff\xfe\x00")
+    out = hsa(env, "review", "t1").stdout
+    assert "red flags in added lines: TODO" in out
+
+
+def test_second_stop_sweeps_commands_a_ghost_restarted(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa({**env, "FAKE_HERMES_SLEEP": "60", "FAKE_HERMES_EARLY_USAGE": "1"}, "dispatch", "t1", str(wd), brief(tmp_path))
+    sid = session_of(env, "t1")
+    hsa(env, "stop", "t1")
+    revived = spawn_sleep(wd, sid)
+    try:
+        out = hsa(env, "stop", "t1").stdout
+        time.sleep(1)
+        assert "client not running" in out and f"swept 1 commands tagged with session {sid}" in out
+        assert not alive(revived.pid)
+    finally:
+        reap(revived)
+
+
+def test_stop_refuses_to_sweep_next_to_a_gateway(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    hsa({**env, "FAKE_HERMES_SLEEP": "60", "FAKE_HERMES_EARLY_USAGE": "1"}, "dispatch", "t1", str(wd), brief(tmp_path))
+    sid = session_of(env, "t1")
+    link = tmp_path / "gw" / "hermes"
+    link.parent.mkdir()
+    link.symlink_to(sys.executable)
+    gateway = subprocess.Popen([str(link), "-c", "import time; time.sleep(300)", "gateway", "run"], cwd=wd)
+    tagged = spawn_sleep(wd, sid)
+    try:
+        time.sleep(0.5)
+        out = hsa(env, "stop", "t1").stdout
+        assert "no sweep" in out and "gateway" in out and alive(tagged.pid)
+    finally:
+        reap(gateway, tagged)
+
+
+def test_loop_passes_when_verify_passes_even_if_worker_crashed(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    verify = tmp_path / "verify.sh"
+    verify.write_text("exit 0\n")
+    crashing = {**env, "FAKE_HERMES_CRASH": "1"}
+    hsa(crashing, "dispatch", "t1", str(wd), brief(tmp_path), "--verify", str(verify))
+    proc = hsa(crashing, "loop", "t1")
+    assert "LOOP PASS (verify passed; worker turn ended crashed)" in proc.stdout
+    assert len(calls(wd)) == 1
+
+
+def test_non_utf8_done_marker_is_failed_not_a_crash(env, tmp_path):
+    run_dir = write_meta(env, "t1", workdir=str(tmp_path), turn=1, pid=0, turn_started_at=time.time(), budget_s=60)
+    (run_dir / "turn-1.done").write_bytes(b"\xff\xfe\x80")
+    proc = hsa(env, "status", "--json")
+    assert json.loads(proc.stdout)[0]["state"] == "failed"
+
+
+def test_meta_without_pid_is_starting_only_briefly(env, tmp_path):
+    write_meta(env, "fresh", workdir=str(tmp_path), turn=1, created_at=time.time())
+    write_meta(env, "old", workdir=str(tmp_path), turn=1, created_at=time.time() - 3600)
+    states = {r["id"]: r["state"] for r in json.loads(hsa(env, "status", "--json").stdout)}
+    assert states == {"fresh": "starting", "old": "crashed"}
+
+
+def test_force_replaces_run_whose_dispatch_died_before_launch(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    write_meta(env, "t1", workdir=str(wd), turn=1, created_at=time.time() - 3600)
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path), "--force")
+    hsa(env, "wait", "t1", "--timeout", "30")
+
+
+def test_verify_pass_is_not_blocked_by_a_daemon_it_leaves_behind(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    verify = tmp_path / "verify.sh"
+    verify.write_text("setsid sleep 29.123 &\nexit 0\n")
+    hsa(env, "dispatch", "t1", str(wd), brief(tmp_path), "--verify", str(verify), "--verify-timeout", "10")
+    hsa(env, "wait", "t1", "--timeout", "30")
+    started = time.time()
+    try:
+        proc = hsa(env, "verify", "t1", check=False)
+        assert proc.returncode == 0 and "VERIFY PASS" in proc.stdout and time.time() - started < 8
+    finally:
+        subprocess.run(["pkill", "-f", "sleep 29.123"])
+
+
+def test_stop_never_signals_live_non_wrapper_without_marker(env, tmp_path):
+    imposter = subprocess.Popen(["sleep", "300"])
+    try:
+        write_meta(env, "t1", workdir=str(tmp_path), turn=1, pid=imposter.pid,
+                   turn_started_at=time.time() - 1000, budget_s=60)
+        out = hsa(env, "stop", "t1").stdout
+        assert "client not running" in out and alive(imposter.pid)
+        assert read_meta(env, "t1")["stopped"] is True
+        assert json.loads(hsa(env, "status", "--json").stdout)[0]["state"] == "stopped"
+    finally:
+        reap(imposter)
+
+
+def test_followup_tolerates_meta_without_turn(env, tmp_path):
+    wd = make_repo(tmp_path / "wd")
+    write_meta(env, "t1", workdir=str(wd), reasoning="low", budget_s=60, terminal_timeout_s=60,
+               session_id="s-1", created_at=time.time() - 3600)
+    proc = hsa(env, "followup", "t1", "go")
+    assert "Traceback" not in proc.stderr and read_meta(env, "t1")["turn"] == 2
+    hsa(env, "wait", "t1", "--timeout", "30")
