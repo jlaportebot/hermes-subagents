@@ -91,7 +91,14 @@ only a viewer. Consequences, all measured and handled:
 `hsa doctor` tells you which mode your install uses.
 
 ## Eval results
-See [`evals/RESULTS.md`](evals/RESULTS.md).
+- Final eval round: **35/35** on five graded tasks with hidden tests (bug fix, spec'd feature, mutation-scored
+  test writing, multi-turn follow-up, verify-and-fix loop), six workers running concurrently; the stop test
+  left 0 processes behind.
+- End-to-end: a fresh Sonnet orchestrator with only this skill delivered three changes (one depending on
+  another) through Hermes workers; hidden test 13/13 on the merged result; **~86K Claude tokens** for the
+  orchestrator vs **~1.05M input tokens** of Hermes work at $0.
+
+Details: [`evals/RESULTS.md`](evals/RESULTS.md).
 
 ## Safety notes
 Workers run with `--yolo` (no approval prompts) — that is what makes unattended work possible, and it is

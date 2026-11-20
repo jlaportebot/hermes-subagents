@@ -857,7 +857,8 @@ def cmd_stop(args: argparse.Namespace) -> None:
     marker = run.done_marker(meta.get("turn", 1))
     killed = False
     if marker.exists():
-        case = "client not running (turn already finished)"
+        case = "client not running (already stopped)" if meta.get("stopped") else \
+            "client not running (turn already finished)"
     elif not mark_stopped(run, marker):
         case = "client not running (turn already finished)"
     elif is_wrapper(meta):
