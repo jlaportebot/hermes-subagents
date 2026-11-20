@@ -77,7 +77,9 @@ With `agent.verify_on_stop` enabled in Hermes' config, Hermes injects up to two 
 verification evidence]" messages after a turn that edited code, unless it saw the project's detected
 full-suite command pass (it detects `pytest` from `pytest.ini`/`[tool.pytest…]`, `npm|pnpm|yarn run test`,
 `make test`, `scripts/run_tests.sh`; a run with explicit test targets counts only as "targeted"). Effects:
-1–2 extra model calls per turn, and the final answer may become an evidence reply instead of the report.
+1–2 extra model calls per turn, the final answer may become an evidence reply instead of the report, and
+the turn stays `running` until the nudges are answered (measured: ~11 extra minutes on a slow endpoint, after
+the worker had already committed and reported; SKILL.md step 7 says when to accept early).
 Mitigations built in: the preamble asks workers to answer an evidence request in one step and then repeat
 the report, and `hsa report`/`hsa review` recover the structured report from the session if it got buried.
 The setting is global Hermes config (and not forwardable per session), so whether to turn it off is the

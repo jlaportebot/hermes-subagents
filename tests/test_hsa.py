@@ -126,6 +126,8 @@ def test_loop_feeds_verify_failure_back_until_pass(env, tmp_path):
     assert "LOOP PASS" in out
     second = calls(wd)[1][1]
     assert "FAILED" in second and "need more: hidden case" in second
+    assert "HSA_BASE=" in second, "the worker must re-run verify against the same base"
+    assert "LOOP PASS: t1 verified on turn 2 after 1 fix round(s)" in out
 
 
 def test_loop_gives_up_after_max_fixes(env, tmp_path):
@@ -751,7 +753,7 @@ def test_loop_passes_when_verify_passes_even_if_worker_crashed(env, tmp_path):
     crashing = {**env, "FAKE_HERMES_CRASH": "1"}
     hsa(crashing, "dispatch", "t1", str(wd), brief(tmp_path), "--verify", str(verify))
     proc = hsa(crashing, "loop", "t1")
-    assert "LOOP PASS (verify passed; worker turn ended crashed)" in proc.stdout
+    assert "LOOP PASS: t1 verified on turn 1 after 0 fix round(s) (verify passed; worker turn ended crashed)" in proc.stdout
     assert len(calls(wd)) == 1
 
 

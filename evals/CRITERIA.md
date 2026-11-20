@@ -28,7 +28,7 @@ orchestrator tokens a review costs).
 | t3-tests | test-writing quality (mutation score), must not touch source |
 | t4-multiturn | `hsa followup`: phase 2 refers to "the function you just added" — needs session memory |
 | t5-loop | hidden test requires a `unit="seconds"` option the brief never mentions; `hsa loop` must feed the failure back until green |
-| t6-stop | `hsa stop` on a worker running a long foreground command: no leftover processes; a server-side turn that keeps going is reported as `ghost` |
+| t6-stop | `hsa stop` on a worker running a long foreground command: no leftover processes; a server-side turn that keeps going is reported as `ghost`; a second `hsa stop` sweeps commands the ghost restarted |
 
 ## Tool criteria (checked by the orchestrator during the run)
 - 5+ workers dispatch concurrently without interfering (separate worktrees, correct session matching).

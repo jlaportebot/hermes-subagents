@@ -957,7 +957,7 @@ Output (last part):
 {output}
 ```
 Find the root cause, fix it in the same working directory, re-run the check yourself
-(`bash {script}` from {workdir}) until it passes, commit, and end with the same final report format
+(`HSA_BASE={base} bash {script}` from {workdir}) until it passes, commit, and end with the same final report format
 (put the passing check output under ACCEPTANCE). If you are blocked, explain exactly what blocks you."""
 
 
@@ -983,22 +983,21 @@ def cmd_loop(args: argparse.Namespace) -> None:
         if rc == VERIFY_MISSING_RC and not Path(meta["verify"]).is_file():
             loop_fail(f"verify script {meta['verify']} not found", 2)
         print(f"turn {meta['turn']} state={state} verify rc={rc}", flush=True)
-        if rc == 0 and state == "done":
-            print("LOOP PASS")
-            return
-        if rc == 0 and state in ("crashed", "failed"):
-            print(f"LOOP PASS (verify passed; worker turn ended {state})")
+        if rc == 0 and state in ("done", "crashed", "failed"):
+            note = "" if state == "done" else f" (verify passed; worker turn ended {state})"
+            print(f"LOOP PASS: {args.id} verified on turn {meta['turn']} after {attempt} fix round(s){note}")
             return
         crashes += state == "crashed"
         if crashes > 1:
             loop_fail("LOOP FAIL (crashed twice)", 1)
         if attempt == args.max_fixes:
             break
-        msg = FIX_TEMPLATE.format(rc=rc, output=output[-3000:], script=meta["verify"], workdir=meta["workdir"])
+        msg = FIX_TEMPLATE.format(rc=rc, output=output[-3000:], script=meta["verify"], workdir=meta["workdir"],
+                                  base=meta.get("base") or "")
         if state != "done":
             msg = f"Your previous turn ended with state '{state}' (not a clean finish).\n\n" + msg
         cmd_followup(argparse.Namespace(id=args.id, message=msg, file=None, budget=None, raw=False))
-    loop_fail("LOOP FAIL", 1)
+    loop_fail(f"LOOP FAIL: {args.id} still fails verify after {args.max_fixes} fix round(s)", 1)
 
 
 # -------------------------------------------------------------------- review

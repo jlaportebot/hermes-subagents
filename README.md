@@ -49,7 +49,7 @@ Requirements: Claude Code, Hermes Agent with a working model provider (`hermes -
 git, Python ≥ 3.9, bash. Platform: Linux only (`hsa` reads `/proc`); macOS and Windows are not supported.
 
 ```bash
-git clone https://github.com/<you>/hermes-subagents && cd hermes-subagents
+git clone https://github.com/jlaportebot/hermes-subagents && cd hermes-subagents
 ./install.sh          # symlinks the skill into ~/.claude/skills and hsa into ~/.local/bin
 hsa doctor            # checks the setup with one tiny real Hermes run
 ```
@@ -82,7 +82,9 @@ hsa review fix-parser
 Recent Hermes versions execute `hermes -z` turns inside the long-lived Hermes gateway; the CLI process is
 only a viewer. Consequences, all measured and handled:
 - `hsa stop` kills the client and the worker's own commands (matched by `HERMES_SESSION_ID`; other workers,
-  your own sessions and gateway helpers are untouched), but the turn can continue server-side; `hsa status` then shows `ghost` until it ends. Keep tasks small and correct with follow-ups.
+  your own sessions and gateway helpers are untouched), but the turn can continue server-side; `hsa status`
+  then shows `ghost` until it ends, and running `hsa stop` again sweeps anything the ghost restarted. Keep
+  tasks small and correct with follow-ups.
 - Only an allowlist of client env vars reaches the session, so `--terminal-timeout`/`--budget` are not hard
   limits there. Workers run long commands in the background and wait on them (rule in the preamble).
 - A follow-up sent to a busy session is queued, not an interrupt.
