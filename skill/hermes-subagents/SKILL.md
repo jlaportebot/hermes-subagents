@@ -22,7 +22,7 @@ All control goes through one CLI: `bin/hsa` in this skill (`SKILL_DIR/bin/hsa`; 
 | `hsa status [--active]` · `hsa tail <id> [-n N]` | live table · latest tool calls of one worker |
 | `hsa followup <id> "msg" \| -f file` | next turn in the same Hermes session |
 | `hsa verify <id>` · `hsa review <id>` · `hsa report <id>` | your check · compact review packet · just the report |
-| `hsa stop <id>` | kill client + its workdir commands (may leave a `ghost` turn on gateway Hermes) |
+| `hsa stop <id>` | kill the client + this worker's own commands (session-tagged); may leave a `ghost` turn on gateway Hermes |
 
 ## Before the first dispatch (once per session)
 ```bash
@@ -56,12 +56,14 @@ campaign on a broken setup. `hsa doctor --no-probe` skips the model call.
    prompt per model call (12.5K vs 26K tokens measured) and no side effects on Hermes' own memory/skills.
    Wall time is dominated by provider latency (30 s to 17 min per call depending on load), not tool count.
    Other options: `-r low|medium|high|xhigh` (default high), `--budget SECONDS` per turn (default 3 h; a
-   client-side cap, see troubleshooting), `--terminal-timeout S` (in-process Hermes only), `-m MODEL`,
+   client-side cap, see troubleshooting), `--terminal-timeout S` (in-process Hermes only), `--verify-timeout S`
+   (default 1800 s per verify run), `-m MODEL`,
    `--clean` (skip AGENTS.md/memory injection), `--skills a,b` to preload Hermes skills.
 5. **Monitor without spending tokens**: start ONE background waiter and get on with other work:
    `hsa wait id1 id2 id3 --any` with `run_in_background: true` → you are notified when any finishes.
    Or `hsa loop <id> --max-fixes 3` in the background: waits, runs verify, and on failure automatically sends
-   the failure output back to the worker as a follow-up turn — the cheapest way to get to green.
+   the failure output back to the worker as a follow-up turn — the cheapest way to get to green. `hsa loop` exits 2 when it needs you (stopped/ghost worker, no verify
+   script) and never restarts a stopped worker.
    No background notifications in this session (headless/print mode, or your Bash tool has no
    `run_in_background`)? Then block in the foreground in chunks under your tool timeout:
    `hsa wait id1 id2 --any --timeout 540` — exit 0 = something finished, non-zero = still running, call again.
@@ -72,7 +74,7 @@ campaign on a broken setup. `hsa doctor --no-probe` skips the model call.
 6. **Interact**: workers are multi-turn. After a turn ends, `hsa followup <id> "<message>"` (or `-f file.md`)
    resumes the *same* Hermes session with full context: corrections, next phase, "explain X", "also do Y".
    Turns can't be steered mid-flight. Prefer letting a turn finish and correcting it with a follow-up:
-   `hsa stop` kills the client and the worker's commands, but with a gateway-hosted Hermes the turn itself can
+   `hsa stop` kills the client and the worker's own session-tagged commands, but with a gateway-hosted Hermes the turn itself can
    keep going server-side (`hsa status` then shows `ghost`; see troubleshooting) — wait for it to end before
    reusing the worktree. A follow-up sent meanwhile is queued and runs after the ghost turn.
 7. **Review**: `hsa review <id>` (one compact packet) + `hsa verify <id>`; then follow
@@ -94,7 +96,7 @@ dozens of slow exploration steps.
 - **In the brief**: the goal, exact files + line ranges, the code excerpt to change, current vs expected
   output, conventions, the acceptance commands, and anything you already learned (failed approaches too).
 - **Reference files**: long material (specs, logs, API docs, a previous worker's report) goes in a file next to
-  the brief; name it in the brief ("read `/path/spec.md` first"). Don't paste 2,000 lines into the prompt.
+  the brief; name it in the brief ("read `/path/spec.md` first"). Don't paste 2,000 lines into the prompt; prompts over 100 KB are refused.
 - **Project rules**: Hermes auto-loads `AGENTS.md`/`CLAUDE.md`-style files from the workdir, plus its own
   memory and skills. `--clean` turns that off when it is noise (unrelated memories, huge rules files).
 - **Tools**: Hermes' default toolsets (terminal, file, code execution, web, browser, its own `delegation`

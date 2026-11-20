@@ -14,8 +14,10 @@
 - `hsa status` column `idle` = time since Hermes last recorded activity. `running` with `idle` < 10 min is
   normal. If `activity` says "waiting for stream response" for a long time the provider is degraded;
   consider `--budget` caps, fewer parallel workers, or a different `-m` model.
-- `--budget SECONDS` is a hard wall clock per turn (default 3 h): the run is killed at the limit and the
-  turn is marked failed; follow up to continue from where it stopped (the session keeps its history).
+- `--budget SECONDS` is a client-side cap per turn (default 3 h). At the limit hsa kills the hermes client and
+  marks the turn failed; on in-process Hermes that ends the run, on gateway-hosted Hermes the turn may keep
+  running server-side until it ends (see Stopping). Follow up to continue from where it stopped (the session
+  keeps its history).
 
 ## Loops and halts
 - `turn_exit_reason: guardrail_halt` (in `hsa review`) = Hermes' own loop detector stopped it, typically after
@@ -23,14 +25,21 @@
 - `max_turns` = too many tool iterations in one turn: split the task, or follow up with "continue".
 - The worker re-runs a failing command forever → the preamble's anti-loop rule should stop it after two
   attempts; if not, `hsa stop` and follow up with the fix hint.
+- **Loop exit codes.** `hsa loop` exit 0 = verify passed, 1 = still failing after `--max-fixes` (or crashed
+  twice), 2 = needs you (no verify script, worker stopped/ghost, verify script missing).
 
 ## Stopping (read this — it is the sharp edge)
 - Recent Hermes versions execute a `hermes -z` turn **inside the Hermes gateway**; the `hermes` client process
   is only a viewer. Killing the client does *not* stop the model loop, and the worker's shell commands are
   children of the gateway, not of the client.
 - `hsa stop <id>` therefore: sends SIGINT to the client (Hermes' own Ctrl+C path), then SIGTERM/SIGKILL to the
-  client tree, then kills every process that a hermes process spawned **inside the worker's workdir** (so
-  the running build/test dies). It cannot end the server-side turn itself.
+  client tree, then kills every process that carries the worker's `HERMES_SESSION_ID` in its environment
+  (Hermes sets it on every command it runs for a session), whose cwd is inside the worker's workdir and that
+  started after the run was dispatched. Other workers, your own Hermes sessions and the gateway's helper
+  processes are never touched, even with nested or shared workdirs. Only if the session id is not known yet
+  does it fall back to a cwd heuristic, and that fallback is skipped when another unfinished run shares or
+  contains the workdir. It cannot end the server-side turn itself. `hsa doctor` reports
+  `session-tagged : yes/no`; `no` means stop cannot use the precise sweep.
 - After a stop, `hsa status` shows `ghost` if the session keeps recording activity. A ghost finishes its
   current turn on its own (it stays confined to its workdir, cannot push). Until it ends: don't reuse that
   worktree and don't send follow-ups. If you must end it now, the session can be interrupted from Hermes'
@@ -77,7 +86,8 @@ user's call.
 ## Follow-ups
 - `hsa followup` needs the Hermes session id, which `hsa` takes from the turn's usage file or, while the
   usage file is not yet written, from `state.db` (matched by working directory + start time — another
-  reason for one worker per directory).
+  reason for one worker per directory). hsa refuses to guess the id when two Hermes sessions started in the
+  same workdir at the same time, and the usage-file id always wins over the state.db match.
 - A follow-up is a new turn in the same session: the worker remembers the brief, its edits and outputs.
   Keep follow-ups specific: what is wrong (paste the failing line), what the expected result is.
 

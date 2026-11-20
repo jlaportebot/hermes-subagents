@@ -34,7 +34,7 @@ edit/test/retry loops.
   | `hsa loop <id> --max-fixes 3` | wait → verify → on failure send the failure back as a follow-up → repeat |
   | `hsa review <id>` | compact review packet: exit reason, commits, diffstat, red flags, final report |
   | `hsa report <id>` | just the worker's structured report (recovered from the session if it got buried) |
-  | `hsa stop <id>` | kill the worker's client and the commands it runs in its workdir |
+  | `hsa stop <id>` | kill the worker's client and its own (session-tagged) commands |
   | `hsa doctor` | setup check + one tiny probe run: latency, env forwarding, gateway vs in-process |
 
 - **The skill** (`skill/hermes-subagents/SKILL.md`): the orchestration workflow Claude follows.
@@ -46,7 +46,7 @@ edit/test/retry loops.
 
 ## Install
 Requirements: Claude Code, Hermes Agent with a working model provider (`hermes -z "say hi"` must work),
-git, Python ≥ 3.9, bash.
+git, Python ≥ 3.9, bash. Platform: Linux only (`hsa` reads `/proc`); macOS and Windows are not supported.
 
 ```bash
 git clone https://github.com/<you>/hermes-subagents && cd hermes-subagents
@@ -63,7 +63,7 @@ Environment knobs: `HSA_RUNS_DIR` (run files, default `~/.local/state/hermes-sub
 ```bash
 WD=$(hsa worktree ~/src/myproj hsa/fix-parser)
 hsa dispatch fix-parser "$WD" briefs/fix-parser.md --verify briefs/fix-parser.verify.sh --coding
-hsa loop fix-parser --max-fixes 3 &      # in Claude Code: run_in_background
+hsa loop fix-parser --max-fixes 3   # Claude runs this with run_in_background; exit 0 = verified
 hsa status
 hsa review fix-parser
 ```
@@ -75,12 +75,14 @@ hsa review fix-parser
 - Follow-ups run `hermes -z <message> --resume <session-id>`, so the worker keeps its full context.
 - Live monitoring reads Hermes' session store (`$HERMES_HOME/state.db`) read-only.
 - Verification is always done by the orchestrator's own script — the worker's report is a claim.
+- Files it touches: run files under `HSA_RUNS_DIR`; worktrees you create with `hsa worktree`; `.hsa-tmp/`
+  added to the repo's `.git/info/exclude` (local to the clone, never committed); nothing else outside the workdir.
 
 ### Gateway-hosted Hermes (important)
 Recent Hermes versions execute `hermes -z` turns inside the long-lived Hermes gateway; the CLI process is
 only a viewer. Consequences, all measured and handled:
-- `hsa stop` kills the client and every command the worker runs in its workdir, but the turn can continue
-  server-side; `hsa status` then shows `ghost` until it ends. Keep tasks small and correct with follow-ups.
+- `hsa stop` kills the client and the worker's own commands (matched by `HERMES_SESSION_ID`; other workers,
+  your own sessions and gateway helpers are untouched), but the turn can continue server-side; `hsa status` then shows `ghost` until it ends. Keep tasks small and correct with follow-ups.
 - Only an allowlist of client env vars reaches the session, so `--terminal-timeout`/`--budget` are not hard
   limits there. Workers run long commands in the background and wait on them (rule in the preamble).
 - A follow-up sent to a busy session is queued, not an interrupt.
