@@ -46,7 +46,7 @@ edit/test/retry loops.
 
 ## Install
 Requirements: Claude Code, Hermes Agent with a working model provider (`hermes -z "say hi"` must work),
-git, Python ≥ 3.9, bash. Platform: Linux only (`hsa` reads `/proc`); macOS and Windows are not supported.
+git, Python ≥ 3.10, bash. Platform: Linux only (`hsa` reads `/proc`); macOS and Windows are not supported.
 
 ```bash
 git clone https://github.com/jlaportebot/hermes-subagents && cd hermes-subagents
